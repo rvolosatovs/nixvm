@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+block2 = "0.6"
 clap = { version = "4", features = ["derive"] }
 krun-sys = { path = "vendor/libkrun/krun-sys", features = ["bindgen_clang_runtime"] }
 libc = "0.2"

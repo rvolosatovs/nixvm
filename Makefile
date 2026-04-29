@@ -18,7 +18,7 @@ CARGO_ENV := PKG_CONFIG_PATH=$(PKG_CONF):$$PKG_CONFIG_PATH \
              LIBRARY_PATH=$(PREFIX)/lib:$$LIBRARY_PATH \
              DYLD_FALLBACK_LIBRARY_PATH=$(PREFIX)/lib:$$DYLD_FALLBACK_LIBRARY_PATH
 
-ENTITLEMENTS := $(LIBKRUN)/hvf-entitlements.plist
+ENTITLEMENTS := nixvm-entitlements.plist
 
 .PHONY: all debug libkrun clean distclean
 
@@ -26,11 +26,11 @@ all: $(LIBKRUN_PC)
 	$(CARGO_ENV) cargo build --release
 	# libkrun calls Hypervisor.framework, which requires the binary to be
 	# codesigned with `com.apple.security.hypervisor`. Ad-hoc sign in place.
-	codesign --sign - --entitlements $(ENTITLEMENTS) target/release/nixvm
+	codesign --force --sign - --entitlements $(ENTITLEMENTS) target/release/nixvm
 
 debug: $(LIBKRUN_PC)
 	$(CARGO_ENV) cargo build
-	codesign --sign - --entitlements $(ENTITLEMENTS) target/debug/nixvm
+	codesign --force --sign - --entitlements $(ENTITLEMENTS) target/debug/nixvm
 
 libkrun: $(LIBKRUN_PC)
 

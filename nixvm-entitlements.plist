@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required by libkrun (Hypervisor.framework). -->
+    <key>com.apple.security.hypervisor</key>
+    <true/>
+    <!-- Required by vmnet.framework on macOS 26+ for unprivileged use
+         (vmnet-helper signs with the same key — see its
+         building/entitlements.plist). -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>

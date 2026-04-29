@@ -47,6 +47,7 @@ in
     "virtio_pci"
     "virtio_blk"
     "virtio_console"
+    "virtio_net"
     "virtiofs"
   ];
 
@@ -75,6 +76,12 @@ in
   systemd.services."getty@hvc0".environment.TERM = "xterm-256color";
   users.users.root.initialHashedPassword = "";
   users.users.root.shell = pkgs.bashInteractive;
+
+  # ---- Networking ---------------------------------------------------------
+  # nixvm wires a virtio-net device backed by Apple's vmnet.framework. The
+  # framework includes a DHCP server, so just enable the client.
+  networking.useDHCP = true;
+  networking.firewall.enable = false; # PoC; lock down later if needed.
 
   # ---- Image build (systemd-repart, no runInLinuxVM) ---------------------
   image.repart.name = imageId;
