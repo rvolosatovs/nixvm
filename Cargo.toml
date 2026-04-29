@@ -1,0 +1,33 @@
+[package]
+name = "nixvm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "nixvm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nixvm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+krun-sys = { path = "vendor/libkrun/krun-sys", features = ["bindgen_clang_runtime"] }
+libc = "0.2"
+rustix = { version = "1", features = ["termios", "process"] }
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+bindgen = "0.71"
+pkg-config = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

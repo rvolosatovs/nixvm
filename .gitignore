@@ -1,0 +1,8 @@
+/target
+/build
+/vendor/libkrun/build
+/vendor/libkrun/target
+/vendor/libkrun/linux-sysroot
+/vendor/libkrun/freebsd-sysroot
+*.swp
+.DS_Store
