@@ -8,7 +8,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -20,12 +20,22 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result, anyhow, bail};
 use tracing::{debug, info, warn};
 
-#[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code
+)]
 mod nix_sys {
     include!(concat!(env!("OUT_DIR"), "/nix_bindings.rs"));
 }
 
-#[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code
+)]
 mod sys {
     include!(concat!(env!("OUT_DIR"), "/sys_bindings.rs"));
 }
@@ -98,8 +108,8 @@ fn launch_vm(overlay: Overlay, id: uuid::Uuid, cpus: u8, mem_mib: u32) -> Result
     // Saving + restoring with a Drop guard cleans up on any exit path.
     let _tty = RawTerminal::enter();
 
-    let exit_code = fork_and_run_vm(&overlay, &vmnet, cpus, mem_mib)
-        .context("failed to launch the VM")?;
+    let exit_code =
+        fork_and_run_vm(&overlay, &vmnet, cpus, mem_mib).context("failed to launch the VM")?;
     // vmnet drops here, AFTER waitpid → pump thread joins, vmnet_stop_interface fires.
     drop(vmnet);
     drop(overlay);
@@ -297,8 +307,7 @@ fn nix_realise_image(flake_uri: &str, attr_path: &str) -> Result<PathBuf> {
 
     // Parse the drv path and realise it.
     let drv_cstr = CString::new(drv_path.clone()).unwrap();
-    let store_path =
-        unsafe { nix_sys::nix_store_parse_path(ctx.raw, store, drv_cstr.as_ptr()) };
+    let store_path = unsafe { nix_sys::nix_store_parse_path(ctx.raw, store, drv_cstr.as_ptr()) };
     ctx.check().context("nix_store_parse_path")?;
     if store_path.is_null() {
         bail!("nix_store_parse_path returned NULL for {drv_path}");
@@ -308,13 +317,7 @@ fn nix_realise_image(flake_uri: &str, attr_path: &str) -> Result<PathBuf> {
     // Realise (build) the derivation. We don't need the callback's output
     // paths since we already evaluated `outPath`.
     unsafe {
-        nix_sys::nix_store_realise(
-            ctx.raw,
-            store,
-            store_path,
-            ptr::null_mut(),
-            None,
-        );
+        nix_sys::nix_store_realise(ctx.raw, store, store_path, ptr::null_mut(), None);
     }
     ctx.check().context("nix_store_realise")?;
 
@@ -329,7 +332,8 @@ fn read_attr_string(
 ) -> Result<String> {
     let cname = CString::new(name).unwrap();
     let attr = unsafe { nix_sys::nix_get_attr_byname(ctx.raw, parent, state, cname.as_ptr()) };
-    ctx.check().with_context(|| format!("nix_get_attr_byname({name})"))?;
+    ctx.check()
+        .with_context(|| format!("nix_get_attr_byname({name})"))?;
     if attr.is_null() {
         bail!("attribute `{name}` missing");
     }
@@ -381,7 +385,10 @@ impl Overlay {
     fn ephemeral(base: &Path, id: uuid::Uuid) -> Result<Self> {
         let path = std::env::temp_dir().join(format!("nixvm-{id}.img"));
         copy_writable(base, &path)?;
-        Ok(Self { path, mode: OverlayMode::Ephemeral })
+        Ok(Self {
+            path,
+            mode: OverlayMode::Ephemeral,
+        })
     }
 
     /// `nixvm run -p PATH`: copy base to PATH, retain on exit.
@@ -394,7 +401,10 @@ impl Overlay {
             );
         }
         copy_writable(base, &dest)?;
-        Ok(Self { path: dest, mode: OverlayMode::Persistent })
+        Ok(Self {
+            path: dest,
+            mode: OverlayMode::Persistent,
+        })
     }
 
     /// `nixvm load PATH`: open PATH in place. Writes mutate it.
@@ -409,7 +419,10 @@ impl Overlay {
                 path.display(),
             );
         }
-        Ok(Self { path, mode: OverlayMode::Loaded })
+        Ok(Self {
+            path,
+            mode: OverlayMode::Loaded,
+        })
     }
 }
 
@@ -438,6 +451,10 @@ fn copy_writable(base: &Path, dest: &Path) -> Result<()> {
 /// later, but doing it eagerly avoids the kernel line discipline buffering
 /// keystrokes during the window between fork and start_enter.
 struct RawTerminal {
+    /// Dup of the TTY captured at entry. The parent later dup2's fd 0 to
+    /// /dev/null so the child is the sole stdin reader; tcsetattr on that
+    /// would silently fail with ENOTTY and leave ISIG off (no ^C).
+    tty: Option<OwnedFd>,
     saved: Option<rustix::termios::Termios>,
 }
 
@@ -445,32 +462,43 @@ impl RawTerminal {
     fn enter() -> Self {
         let stdin = std::io::stdin();
         if !rustix::termios::isatty(&stdin) {
-            return Self { saved: None };
+            return Self {
+                tty: None,
+                saved: None,
+            };
         }
-        let saved = match rustix::termios::tcgetattr(&stdin) {
+        let tty = match stdin.as_fd().try_clone_to_owned() {
+            Ok(fd) => fd,
+            Err(_) => {
+                return Self {
+                    tty: None,
+                    saved: None,
+                };
+            }
+        };
+        let saved = match rustix::termios::tcgetattr(&tty) {
             Ok(t) => t,
-            Err(_) => return Self { saved: None },
+            Err(_) => {
+                return Self {
+                    tty: None,
+                    saved: None,
+                };
+            }
         };
         let mut raw = saved.clone();
         raw.make_raw();
-        let _ = rustix::termios::tcsetattr(
-            &stdin,
-            rustix::termios::OptionalActions::Now,
-            &raw,
-        );
-        Self { saved: Some(saved) }
+        let _ = rustix::termios::tcsetattr(&tty, rustix::termios::OptionalActions::Now, &raw);
+        Self {
+            tty: Some(tty),
+            saved: Some(saved),
+        }
     }
 }
 
 impl Drop for RawTerminal {
     fn drop(&mut self) {
-        if let Some(saved) = &self.saved {
-            let stdin = std::io::stdin();
-            let _ = rustix::termios::tcsetattr(
-                &stdin,
-                rustix::termios::OptionalActions::Now,
-                saved,
-            );
+        if let (Some(tty), Some(saved)) = (&self.tty, &self.saved) {
+            let _ = rustix::termios::tcsetattr(tty, rustix::termios::OptionalActions::Now, saved);
         }
     }
 }
@@ -504,9 +532,7 @@ impl Vmnet {
 
         // 2. Serial dispatch queue for vmnet's start callback + event callback.
         let label = c"nixvm.vmnet";
-        let queue = unsafe {
-            sys::dispatch_queue_create(label.as_ptr(), ptr::null_mut())
-        };
+        let queue = unsafe { sys::dispatch_queue_create(label.as_ptr(), ptr::null_mut()) };
         if queue.is_null() {
             bail!("dispatch_queue_create returned NULL");
         }
@@ -663,9 +689,7 @@ unsafe fn stop_vmnet_blocking(iface: sys::interface_ref, queue: sys::dispatch_qu
         *lock.lock().unwrap() = true;
         cv.notify_all();
     });
-    let _ = unsafe {
-        sys::vmnet_stop_interface(iface, queue, &*stop_block as *const _ as *mut _)
-    };
+    let _ = unsafe { sys::vmnet_stop_interface(iface, queue, &*stop_block as *const _ as *mut _) };
     let (lock, cv) = &*done;
     let mut guard = lock.lock().unwrap();
     while !*guard {
@@ -683,14 +707,22 @@ fn parse_start_params(params: sys::xpc_object_t) -> StartParams {
     // MAC arrives as "aa:bb:cc:dd:ee:ff".
     let mac_cstr = unsafe { sys::xpc_dictionary_get_string(params, sys::vmnet_mac_address_key) };
     let mac = if !mac_cstr.is_null() {
-        parse_mac(unsafe { CStr::from_ptr(mac_cstr) }.to_string_lossy().as_ref())
+        parse_mac(
+            unsafe { CStr::from_ptr(mac_cstr) }
+                .to_string_lossy()
+                .as_ref(),
+        )
     } else {
         [0; 6]
     };
     let mtu = unsafe { sys::xpc_dictionary_get_uint64(params, sys::vmnet_mtu_key) } as u16;
     let max_packet_size =
         unsafe { sys::xpc_dictionary_get_uint64(params, sys::vmnet_max_packet_size_key) } as usize;
-    StartParams { mac, mtu, max_packet_size }
+    StartParams {
+        mac,
+        mtu,
+        max_packet_size,
+    }
 }
 
 fn parse_mac(s: &str) -> [u8; 6] {
@@ -703,9 +735,7 @@ fn parse_mac(s: &str) -> [u8; 6] {
 
 fn socketpair_dgram() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds: [c_int; 2] = [-1; 2];
-    let rc = unsafe {
-        libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr())
-    };
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
     if rc != 0 {
         bail!("socketpair: {}", std::io::Error::last_os_error());
     }
@@ -756,9 +786,7 @@ fn drain_vmnet_to_socket(iface: sys::interface_ref, fd: RawFd, max_pkt: usize) {
             return;
         }
         // pkt.vm_pkt_size now holds the actual packet length.
-        let n = unsafe {
-            libc::write(fd, buf.as_ptr() as *const c_void, pkt.vm_pkt_size)
-        };
+        let n = unsafe { libc::write(fd, buf.as_ptr() as *const c_void, pkt.vm_pkt_size) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::EAGAIN) {
@@ -774,9 +802,7 @@ fn drain_vmnet_to_socket(iface: sys::interface_ref, fd: RawFd, max_pkt: usize) {
 fn pump_socket_to_vmnet(fd: RawFd, iface: sys::interface_ref, max_pkt: usize) {
     let mut buf = vec![0u8; max_pkt];
     loop {
-        let n = unsafe {
-            libc::read(fd, buf.as_mut_ptr() as *mut c_void, max_pkt)
-        };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, max_pkt) };
         if n <= 0 {
             return; // EOF or error → exit
         }
@@ -822,9 +848,14 @@ fn fork_and_run_vm(overlay: &Overlay, vmnet: &Vmnet, cpus: u8, mem_mib: u32) -> 
         // Child: configure libkrun and start the VM. krun_start_enter() does
         // not return; on failure we _exit() with a distinguishable code so
         // the parent can surface it.
-        if let Err(err) =
-            configure_and_start_vm(overlay.path.as_path(), cpus, mem_mib, net_fd, net_mac, net_mtu)
-        {
+        if let Err(err) = configure_and_start_vm(
+            overlay.path.as_path(),
+            cpus,
+            mem_mib,
+            net_fd,
+            net_mac,
+            net_mtu,
+        ) {
             // Use raw stderr write here, not tracing — the subscriber may
             // already be tearing down post-fork. The user sees this if the
             // VM never started.
@@ -884,7 +915,10 @@ fn configure_and_start_vm(
     }
     let ctx = ctx as u32;
 
-    krun_check(unsafe { krun_set_vm_config(ctx, cpus, mem_mib) }, "krun_set_vm_config")?;
+    krun_check(
+        unsafe { krun_set_vm_config(ctx, cpus, mem_mib) },
+        "krun_set_vm_config",
+    )?;
 
     let firmware = CString::new(NIXVM_EDK2_PATH).unwrap();
     krun_check(
@@ -961,6 +995,9 @@ fn krun_check(rc: i32, what: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(anyhow!("{what} failed: {rc} ({})", std::io::Error::from_raw_os_error(-rc)))
+        Err(anyhow!(
+            "{what} failed: {rc} ({})",
+            std::io::Error::from_raw_os_error(-rc)
+        ))
     }
 }

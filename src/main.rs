@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "nixvm",
     about = "Launch a Nix flake output as a Linux VM via libkrun",
-    arg_required_else_help = true,
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,13 +61,22 @@ fn main() -> ExitCode {
         .init();
 
     let result = match Cli::parse().command {
-        Command::Run { flake_ref, persist, cpus, memory_mib } => nixvm::run(nixvm::RunArgs {
+        Command::Run {
+            flake_ref,
+            persist,
+            cpus,
+            memory_mib,
+        } => nixvm::run(nixvm::RunArgs {
             flake_ref,
             persist,
             cpus,
             memory_mib,
         }),
-        Command::Load { path, cpus, memory_mib } => nixvm::load(nixvm::LoadArgs {
+        Command::Load {
+            path,
+            cpus,
+            memory_mib,
+        } => nixvm::load(nixvm::LoadArgs {
             path,
             cpus,
             memory_mib,
