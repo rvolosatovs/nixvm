@@ -136,13 +136,18 @@ fn canonicalize_flake_uri(uri: &str) -> Result<String> {
 }
 
 fn split_flake_ref(s: &str) -> Result<(String, String)> {
+    if s.is_empty() {
+        bail!("flake ref is empty");
+    }
     // Split on the LAST `#` to allow URIs that contain `#` in lockless params
     // (rare but real). `git+ssh://...?ref=foo#attr` still parses correctly.
+    // No `#` → default to `nixosConfigurations.default`.
     match s.rsplit_once('#') {
         Some((uri, attr)) if !uri.is_empty() && !attr.is_empty() => {
             Ok((uri.to_string(), attr.to_string()))
         }
-        _ => bail!("flake ref must be of the form `<flake>#<attr-path>`, got `{s}`"),
+        Some(_) => bail!("invalid flake ref `{s}`: expected `<flake>[#<attr-path>]`"),
+        None => Ok((s.to_string(), "nixosConfigurations.default".to_string())),
     }
 }
 
@@ -275,12 +280,16 @@ fn nix_realise_image(flake_uri: &str, attr_path: &str) -> Result<PathBuf> {
     }
     let _state_guard = scopeguard(|| unsafe { nix_sys::nix_state_free(state) });
 
-    // Evaluate the derivation, pulling out both drvPath (to realise) and
-    // outPath (the path the realised output will live at). Avoids needing to
-    // walk the realise callback to recover the absolute output path.
+    // Evaluate the NixOS configuration's image derivation, pulling out
+    // drvPath (to realise) and the absolute path of the inner raw file.
+    // `system.build.image` is a directory derivation; `image.fileName` is the
+    // basename of the raw image inside it. Computing the full path here
+    // avoids needing the user to wrap the output in a `runCommand` symlink.
     let expr = CString::new(format!(
-        r#"let drv = (builtins.getFlake "{uri}").{attr};
-            in {{ drvPath = drv.drvPath; outPath = drv.outPath; }}"#,
+        r#"let cfg = (builtins.getFlake "{uri}").{attr};
+               img = cfg.config.system.build.image;
+            in {{ drvPath = img.drvPath;
+                  outPath = "${{img.outPath}}/${{cfg.config.image.fileName}}"; }}"#,
         uri = flake_uri.escape_default(),
         attr = attr_path,
     ))

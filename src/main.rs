@@ -18,7 +18,10 @@ struct Cli {
 enum Command {
     /// Build a flake's image and boot it.
     Run {
-        /// Flake reference, e.g. `github:user/repo#name` or `path:./examples#test`.
+        /// Flake reference, e.g. `github:user/repo` or
+        /// `path:./examples#nixosConfigurations.test`. The attribute path
+        /// must point to a NixOS configuration; if omitted, defaults to
+        /// `nixosConfigurations.default`.
         flake_ref: String,
 
         /// Save the image to PATH instead of an ephemeral tempfile.
