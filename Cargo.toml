@@ -28,7 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7"] }
 
 [build-dependencies]
-bindgen = "0.71"
+bindgen = "0.72"
 cc = "1"
 pkg-config = "0.3"
 
