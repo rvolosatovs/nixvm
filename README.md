@@ -14,6 +14,8 @@ TCP/UDP all work. Nix store shared read-only from the host via
 virtio-fs. State is ephemeral — a fresh per-launch overlay of the built
 image, deleted on exit.
 
+> **Note:** this project is mostly AI-generated.
+
 ## How it works
 
 ```
