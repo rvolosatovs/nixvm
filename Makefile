@@ -5,6 +5,7 @@
 #   make            -> release nixvm binary
 #   make debug      -> debug nixvm binary
 #   make libkrun    -> just build + install libkrun into ./build/prefix
+#   make install    -> cargo install --path . + codesign installed binary
 #   make clean      -> remove ./build and cargo target
 #   make distclean  -> also clean libkrun submodule
 
@@ -20,7 +21,7 @@ CARGO_ENV := PKG_CONFIG_PATH=$(PKG_CONF):$$PKG_CONFIG_PATH \
 
 ENTITLEMENTS := entitlements.plist
 
-.PHONY: all debug libkrun clean distclean
+.PHONY: all debug libkrun install clean distclean
 
 all: $(LIBKRUN_PC)
 	$(CARGO_ENV) cargo build --release
@@ -33,6 +34,14 @@ debug: $(LIBKRUN_PC)
 	codesign --force --sign - --entitlements $(ENTITLEMENTS) target/debug/nixvm
 
 libkrun: $(LIBKRUN_PC)
+
+install: $(LIBKRUN_PC)
+	$(CARGO_ENV) cargo install --path . --locked
+	# `cargo install` strips the codesignature applied to the cached
+	# target/release/nixvm. Re-sign the installed copy so libkrun can call
+	# Hypervisor.framework.
+	codesign --force --sign - --entitlements $(ENTITLEMENTS) \
+	  "$${CARGO_INSTALL_ROOT:-$${CARGO_HOME:-$$HOME/.cargo}}/bin/nixvm"
 
 $(LIBKRUN_PC):
 	# Pass PREFIX during build too: libkrun runs install_name_tool at build
