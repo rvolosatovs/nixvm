@@ -53,7 +53,7 @@ disk image bootable under libkrun. Concretely, the image must satisfy:
 - DHCP enabled (e.g. `networking.useDHCP = true;`) so the virtio-net
   interface gets an IP from vmnet's built-in DHCP server.
 
-`examples/test-vm/module.nix` is a reference NixOS module satisfying all of
+`examples/minimal/module.nix` is a reference NixOS module satisfying all of
 these — copy it or import it into your own flake.
 
 `examples/nixelium/` shows how to bolt the contract onto an *existing*
@@ -83,10 +83,10 @@ incremental edits with `cargo build --release` directly (with the right
 
 ```sh
 # build the example image (needs a linux builder)
-nix build path:./examples/test-vm#packages.aarch64-linux.default
+nix build path:./examples/minimal#packages.aarch64-linux.default
 
 # launch it
-./target/release/nixvm path:./examples/test-vm#packages.aarch64-linux.default
+./target/release/nixvm path:./examples/minimal#packages.aarch64-linux.default
 ```
 
 Press `Ctrl+D` or run `poweroff` inside the guest to exit. `Ctrl+C` is
@@ -94,7 +94,7 @@ forwarded to the guest as SIGINT (the host TTY is in raw mode).
 
 ### Image build on Determinate Nix
 
-`examples/test-vm` builds with `image.repart` (systemd-repart) instead
+`examples/minimal` builds with `image.repart` (systemd-repart) instead
 of `make-disk-image.nix`, so it works inside Determinate Nix's
 `external-builders` VM out of the box (no nested QEMU, no privileged
 ops). The image uses a UKI dropped at the EFI fallback path
@@ -124,7 +124,7 @@ bootloader install step.
 ├── src/
 │   ├── main.rs                # clap CLI
 │   └── lib.rs                 # Nix eval/realise + libkrun + vmnet pump + fork
-├── examples/test-vm/          # minimal reference NixOS image fitting the contract
+├── examples/minimal/          # minimal reference NixOS image fitting the contract
 ├── examples/nixelium/         # imports the nixelium flake and adapts it to the contract
 └── vendor/libkrun/            # git submodule (containers/libkrun, pinned)
 ```

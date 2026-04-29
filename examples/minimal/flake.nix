@@ -1,6 +1,6 @@
 # Minimal test flake for nixvm.
 #
-# Run via nixvm:     nixvm run path:./examples/test-vm
+# Run via nixvm:     nixvm run path:./examples/minimal
 {
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
   inputs.nixvm.url = "git+file:../..";
