@@ -70,11 +70,17 @@ ordinary outbound traffic Just Work. No inbound connections.
 in one place. `examples/minimal/module.nix` shows the minimum on top
 (image identity + stateVersion).
 
-`examples/nixelium/` shows how to bolt the contract onto an *existing*
-NixOS configuration: it imports
-[`nixelium`](https://github.com/rvolosatovs/nixelium)'s baseline
-`nixosModules.default` and overrides only what libkrun requires
-(lanzaboote / systemd-boot off — nixvm boots the kernel directly).
+Out-of-tree configurations can import `nixvm.nixosModules.guest`
+directly. For example,
+[`nixelium`](https://github.com/rvolosatovs/nixelium) exposes a
+nixvm-ready variant of its baseline NixOS module:
+
+```sh
+nixvm run --override-input nixvm . github:rvolosatovs/nixelium#nixosConfigurations.aarch64-linux-vm-nixvm
+```
+
+(The `--override-input nixvm .` points the upstream flake's `nixvm`
+input at this checkout — drop it once you're running a tagged release.)
 
 ## Build
 
@@ -137,7 +143,6 @@ so there's no UKI, no ESP, and no bootloader install step.
 │   ├── main.rs                # clap CLI
 │   └── lib.rs                 # Nix eval/realise + libkrun + vmnet pump + fork
 ├── examples/minimal/          # minimal reference NixOS image fitting the contract
-├── examples/nixelium/         # imports the nixelium flake and adapts it to the contract
 └── vendor/libkrun/            # git submodule (containers/libkrun, pinned)
 ```
 

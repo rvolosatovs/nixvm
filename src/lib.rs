@@ -490,7 +490,7 @@ fn nix_realise_image(flake_uri: &str, overrides: &[(String, String)]) -> Result<
     let _state_guard = scopeguard(|| unsafe { nix_sys::nix_state_free(state) });
 
     // Parse-flags' base directory makes nix resolve user-supplied relative
-    // paths (e.g. `./examples/nixelium`) against $PWD, exactly like `nix build`.
+    // paths (e.g. `./examples/minimal`) against $PWD, exactly like `nix build`.
     let parse_flags =
         unsafe { nix_sys::nix_flake_reference_parse_flags_new(ctx.raw, flake_settings) };
     ctx.check().context("nix_flake_reference_parse_flags_new")?;
