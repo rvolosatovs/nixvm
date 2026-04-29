@@ -1,12 +1,12 @@
 # nixvm example: import the nixelium flake and produce a libkrun-bootable
 # raw EFI image of its baseline NixOS module.
 #
-# Run via nixvm:     nixvm run path:./examples/nixelium
+# Run via nixvm:     nixvm run ./examples/nixelium
 {
   description = "nixvm image built from nixelium's nixosModules.default";
 
   inputs.nixelium.url = "github:rvolosatovs/nixelium";
-  inputs.nixvm.url = "git+file:../..";
+  inputs.nixvm.url = "github:rvolosatovs/nixvm";
 
   outputs =
     { nixelium, nixvm, ... }:

@@ -4,7 +4,7 @@
 # ephemeral VM.
 #
 # Overrides:
-#   - lanzaboote / systemd-boot off (UKI dropped at the EFI fallback path)
+#   - lanzaboote / systemd-boot off (nixvm boots the kernel directly)
 #   - tailscale off (no out-of-band auth in ephemeral runs)
 #   - home-manager users cleared (nixelium's user closure is huge — rust
 #     toolchains, neovim, fonts — and not needed for a smoke-test VM)

@@ -5,13 +5,18 @@
 # then add image-specific bits (hostname, stateVersion, extra packages).
 #
 # Wires the contract end-to-end:
-#   - raw GPT image with ESP + UKI at \EFI\BOOT\BOOT<arch>.EFI (no bootloader)
+#   - direct kernel boot (no UKI, no firmware): nixvm passes the kernel,
+#     initrd, and cmdline to libkrun via krun_set_kernel; the image is a
+#     single ext4 root partition
 #   - console=hvc0, virtio + overlay modules in initrd
 #   - /nix/store overlay: virtiofs from host (ro) ∪ tmpfs (rw) so guest
 #     activation (home-manager, nix-env, GC roots) can write the store
 #     without the writes escaping back to the host's /nix/store
 #   - DHCP client (vmnet's NAT mode is the DHCP server)
 #   - autologin on hvc0
+#   - boot-time `nix-store --load-db` of a closureInfo registration file
+#     pointed to by `regInfo=<path>` on the kernel cmdline (nixvm injects
+#     this), so paths visible via virtiofs are valid in the guest's DB
 {
   config,
   lib,
@@ -20,12 +25,15 @@
   ...
 }:
 
+let
+  closureInfo = pkgs.closureInfo { rootPaths = [ config.system.build.toplevel ]; };
+in
 {
   imports = [ "${modulesPath}/image/repart.nix" ];
 
   # ---- Boot ---------------------------------------------------------------
-  # No bootloader: libkrun's EDK2 firmware boots the UKI from the EFI
-  # fallback path (\EFI\BOOT\BOOT<arch>.EFI).
+  # No bootloader and no UKI: nixvm boots the kernel directly with
+  # krun_set_kernel, supplying its own cmdline.
   boot.loader.grub.enable = lib.mkDefault false;
   boot.loader.systemd-boot.enable = lib.mkDefault false;
   boot.loader.efi.canTouchEfiVariables = lib.mkDefault false;
@@ -41,6 +49,35 @@
     "virtiofs"
     "overlay"
   ];
+
+  # NixOS's default re-binds /nix/store with `ro` after stage-2, which
+  # would stack a read-only overlay on top of the writable initrd overlay
+  # below and break every guest write (home-manager activation, nix-env,
+  # GC roots) with EROFS. Drop the `ro` so the underlying overlay's
+  # writes actually land.
+  boot.nixStoreMountOpts = lib.mkDefault [ ];
+
+  # ---- /nix/store registration --------------------------------------------
+  # /nix/store is virtiofs-shared from the host, so the closure's paths
+  # physically exist under the overlay's lower layer — but the guest's
+  # Nix database (on the root partition) starts empty. Without registration,
+  # `nix-store --realise` against a closure-resident path (home-manager's
+  # GC root creation, `nix run`, etc.) falls through to substituters and
+  # fails ("no substituter that can build it").
+  #
+  # We mirror nixos/modules/virtualisation/qemu-vm.nix: nixvm passes
+  # `regInfo=<path>` on the kernel cmdline, where the path points at a
+  # `pkgs.closureInfo` registration file (also in the host's /nix/store
+  # and reachable via the same virtiofs share). The closure_info derivation
+  # is exposed as `system.build.closureInfo` so nixvm can evaluate its
+  # outPath without re-doing the closure walk itself.
+  system.build.closureInfo = closureInfo;
+
+  boot.postBootCommands = ''
+    if [[ "$(cat /proc/cmdline)" =~ regInfo=([^[:space:]]+) ]]; then
+      ${config.nix.package.out}/bin/nix-store --load-db < "''${BASH_REMATCH[1]}"
+    fi
+  '';
 
   # ---- Filesystems --------------------------------------------------------
   fileSystems."/".device = "/dev/disk/by-partlabel/nixos";
@@ -77,7 +114,6 @@
   # terminals (kitty, iTerm, Terminal.app).
   systemd.services."getty@hvc0".environment.TERM = "xterm-256color";
   users.users.root.initialHashedPassword = lib.mkDefault "";
-  users.users.root.shell = lib.mkDefault pkgs.bashInteractive;
 
   # ---- Networking ---------------------------------------------------------
   # nixvm wires virtio-net to vmnet (Apple's framework). Vmnet shared mode
@@ -86,26 +122,18 @@
   networking.firewall.enable = lib.mkDefault false;
 
   # ---- Image build (systemd-repart, no runInLinuxVM) ---------------------
+  # Single ext4 root partition — no ESP, no UKI: nixvm passes kernel +
+  # initrd to libkrun directly from the host's /nix/store.
   image.repart.name = lib.mkDefault config.system.image.id;
 
-  # ESP: vfat, holds the UKI at the EFI fallback path so libkrun's EDK2
-  # picks it up directly with no bootloader install step.
-  image.repart.partitions."10-esp".contents."/EFI/BOOT/BOOT${lib.toUpper pkgs.stdenv.hostPlatform.efiArch}.EFI".source =
-    "${config.system.build.uki}/${config.system.boot.loader.ukiFile}";
-  image.repart.partitions."10-esp".repartConfig.Type = "esp";
-  image.repart.partitions."10-esp".repartConfig.Format = "vfat";
-  # NixOS aarch64 UKIs hover around 70 MiB; 256M leaves headroom and
-  # keeps the whole image inside the determinate-nixd builder's tmpfs.
-  image.repart.partitions."10-esp".repartConfig.SizeMinBytes = "256M";
-  image.repart.partitions."10-esp".repartConfig.SizeMaxBytes = "256M";
-
-  # Root: small ext4 — the closure ships from the host via virtiofs, the
-  # guest only needs space for /var, /etc, /tmp, /home runtime state.
-  image.repart.partitions."20-root".repartConfig.Type = "root";
-  image.repart.partitions."20-root".repartConfig.Format = "ext4";
-  image.repart.partitions."20-root".repartConfig.Label = "nixos";
-  image.repart.partitions."20-root".repartConfig.SizeMinBytes = "32M";
-  image.repart.partitions."20-root".repartConfig.SizeMaxBytes = "32M";
+  image.repart.partitions."10-root".repartConfig.Type = "root";
+  image.repart.partitions."10-root".repartConfig.Format = "ext4";
+  image.repart.partitions."10-root".repartConfig.Label = "nixos";
+  # Headroom for /var (notably /var/nix/db.sqlite once the closure is
+  # registered) plus /etc, /home, /tmp runtime state. 256M keeps the whole
+  # image inside the determinate-nixd builder's tmpfs.
+  image.repart.partitions."10-root".repartConfig.SizeMinBytes = "256M";
+  image.repart.partitions."10-root".repartConfig.SizeMaxBytes = "256M";
 
   documentation.enable = lib.mkDefault false;
   documentation.man.enable = lib.mkDefault false;

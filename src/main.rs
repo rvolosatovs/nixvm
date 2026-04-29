@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -23,6 +24,18 @@ enum Command {
         /// must point to a NixOS configuration; if omitted, defaults to
         /// `nixosConfigurations.default`.
         flake_ref: String,
+
+        /// Override a flake input. Repeatable. Same syntax as
+        /// `nix build --override-input KEY URI`. Useful for pointing
+        /// `inputs.nixvm` at a local checkout, e.g.
+        /// `--override-input nixvm path:.`.
+        #[arg(
+            long = "override-input",
+            value_names = ["KEY", "URI"],
+            num_args = 2,
+            action = clap::ArgAction::Append,
+        )]
+        override_input: Vec<String>,
 
         /// Save the image to PATH instead of an ephemeral tempfile.
         /// Resume later with `nixvm load PATH`.
@@ -66,14 +79,18 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Run {
             flake_ref,
+            override_input,
             persist,
             cpus,
             memory_mib,
-        } => nixvm::run(nixvm::RunArgs {
-            flake_ref,
-            persist,
-            cpus,
-            memory_mib,
+        } => parse_overrides(override_input).and_then(|overrides| {
+            nixvm::run(nixvm::RunArgs {
+                flake_ref,
+                overrides,
+                persist,
+                cpus,
+                memory_mib,
+            })
         }),
         Command::Load {
             path,
@@ -93,4 +110,18 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Pair up the flat `--override-input KEY URI` Vec produced by clap
+/// (`num_args = 2, action = Append`) into `(key, uri)` tuples.
+fn parse_overrides(raw: Vec<String>) -> Result<Vec<(String, String)>> {
+    if raw.len() % 2 != 0 {
+        return Err(anyhow!(
+            "--override-input requires `KEY URI` (got odd argument count)"
+        ));
+    }
+    Ok(raw
+        .chunks_exact(2)
+        .map(|c| (c[0].clone(), c[1].clone()))
+        .collect())
 }

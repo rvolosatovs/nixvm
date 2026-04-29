@@ -1,7 +1,8 @@
-# Minimal smoke-test image. The host↔guest contract (image.repart layout,
-# UKI at the EFI fallback path, virtiofs+overlay /nix/store, autologin on
-# hvc0, DHCP) lives in nixvm.nixosModules.guest — this module just adds
-# image identity and stateVersion.
+# Minimal smoke-test image. The host↔guest contract (single-partition
+# image.repart layout, virtiofs+overlay /nix/store, autologin on hvc0,
+# DHCP, closure registration via regInfo=) lives in
+# nixvm.nixosModules.guest — this module just adds image identity and
+# stateVersion.
 {
   system.image.id = "nixvm-test";
   system.image.version = "1";

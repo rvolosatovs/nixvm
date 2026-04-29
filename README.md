@@ -41,27 +41,38 @@ ordinary outbound traffic Just Work. No inbound connections.
 
 ## Flake-output contract
 
-`<flake>#<attr-path>` must evaluate to a derivation that builds a raw EFI
-disk image bootable under libkrun. Concretely, the image must satisfy:
+`<flake>#<attr-path>` must evaluate to a NixOS configuration whose
+`config.system.build` exposes everything nixvm boots from. Concretely:
 
-- Raw format (not qcow2) with a GPT partition table and an EFI System Partition.
+- A raw single-partition root-fs image at `system.build.image` /
+  `image.fileName` (no GPT/ESP/UKI — nixvm boots the kernel directly via
+  `krun_set_kernel`).
+- `system.build.toplevel` staging `kernel`, `initrd`, `init`, and
+  `kernel-params` at the conventional paths inside it (NixOS already
+  does this).
+- `system.build.closureInfo` exposing a `pkgs.closureInfo`-style
+  registration file — pointed to by `regInfo=` on the cmdline so the
+  guest can `nix-store --load-db` paths visible via virtiofs.
 - Kernel parameters include `console=hvc0`.
 - Initrd contains the modules `virtio_pci`, `virtio_blk`, `virtio_console`, `virtio_net`, `virtiofs`.
 - Mounts the host's `/nix/store` from virtiofs with mount tag `nixstore`,
-  read-only, marked `neededForBoot`.
+  read-only, marked `neededForBoot`, with a tmpfs-upper overlay on top
+  so the guest can write the store.
+- `boot.nixStoreMountOpts = [ ]` so NixOS doesn't re-bind the store
+  read-only after stage-2 (which would shadow the writable overlay).
 - Has a getty (or auto-login) on `hvc0` so the user lands in a shell on boot.
 - DHCP enabled (e.g. `networking.useDHCP = true;`) so the virtio-net
   interface gets an IP from vmnet's built-in DHCP server.
 
-`examples/minimal/module.nix` is a reference NixOS module satisfying all of
-these — copy it or import it into your own flake.
+`nixvm.nixosModules.guest` (in `modules/guest.nix`) wires all of this up
+in one place. `examples/minimal/module.nix` shows the minimum on top
+(image identity + stateVersion).
 
 `examples/nixelium/` shows how to bolt the contract onto an *existing*
 NixOS configuration: it imports
 [`nixelium`](https://github.com/rvolosatovs/nixelium)'s baseline
 `nixosModules.default` and overrides only what libkrun requires
-(lanzaboote off, `console=hvc0`, virtio modules, virtiofs `/nix/store`,
-UKI at the EFI fallback path).
+(lanzaboote / systemd-boot off — nixvm boots the kernel directly).
 
 ## Build
 
@@ -97,13 +108,12 @@ forwarded to the guest as SIGINT (the host TTY is in raw mode).
 `examples/minimal` builds with `image.repart` (systemd-repart) instead
 of `make-disk-image.nix`, so it works inside Determinate Nix's
 `external-builders` VM out of the box (no nested QEMU, no privileged
-ops). The image uses a UKI dropped at the EFI fallback path
-(`/EFI/BOOT/BOOTAA64.EFI`) so libkrun's EDK2 boots it without any
-bootloader install step.
+ops). The image is a single ext4 root partition — nixvm passes the
+kernel + initrd + cmdline to libkrun directly via `krun_set_kernel`,
+so there's no UKI, no ESP, and no bootloader install step.
 
 ## Out of scope (for now)
 
-- Read-write `/nix/store` (planned: OverlayFS in the guest with a tmpfs upper)
 - Persistent volumes (no `--volume` flag yet)
 - Inbound network connections / port forwarding from the host
 - macOS < 26 (unprivileged `vmnet` requires 26)

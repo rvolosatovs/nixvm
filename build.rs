@@ -2,20 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-    // Path to the EDK2 UEFI firmware blob shipped inside libkrun.
-    let edk2_firmware = manifest_dir.join("vendor/libkrun/edk2/KRUN_EFI.silent.fd");
-    assert!(
-        edk2_firmware.exists(),
-        "EDK2 firmware not found at {} — did you `git submodule update --init`?",
-        edk2_firmware.display()
-    );
-    println!(
-        "cargo:rustc-env=NIXVM_EDK2_PATH={}",
-        edk2_firmware.display()
-    );
 
     // Nix C API: pkg-config to locate, bindgen to generate bindings.
     let probe = |name: &str| {

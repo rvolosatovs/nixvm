@@ -40,11 +40,12 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/sys_bindings.rs"));
 }
 
-const NIXVM_EDK2_PATH: &str = env!("NIXVM_EDK2_PATH");
-
 #[derive(Debug, Clone)]
 pub struct RunArgs {
     pub flake_ref: String,
+    /// `(key, uri)` pairs from `--override-input KEY URI`, applied during
+    /// flake locking. Mirrors `nix build --override-input`.
+    pub overrides: Vec<(String, String)>,
     /// If `Some`, copy the image to this path and keep it across exit.
     /// Resume later with `nixvm load <path>`.
     pub persist: Option<PathBuf>,
@@ -60,25 +61,65 @@ pub struct LoadArgs {
     pub memory_mib: u32,
 }
 
+/// Output of [`nix_realise_image`]: every host path the launch needs.
+#[derive(Debug)]
+struct Realised {
+    image_file: PathBuf,
+    toplevel: PathBuf,
+    closure_info: PathBuf,
+}
+
+/// Inputs to libkrun's `krun_set_kernel`, derived from a realised toplevel.
+#[derive(Debug)]
+struct BootInputs {
+    kernel: PathBuf,
+    initrd: PathBuf,
+    cmdline: String,
+}
+
 /// Build a flake's image and boot it. Ephemeral overlay unless `persist` is set.
 pub fn run(args: RunArgs) -> Result<u8> {
     let id = uuid::Uuid::now_v7();
     info!(%id, "starting");
 
-    let (flake_uri, attr_path) = split_flake_ref(&args.flake_ref)?;
-    let flake_uri = canonicalize_flake_uri(&flake_uri)?;
-    debug!(flake = %flake_uri, attr = %attr_path, "evaluating + realising flake output");
-    let image_path = nix_realise_image(&flake_uri, &attr_path)
+    debug!(flake = %args.flake_ref, "evaluating + realising flake output");
+    let realised = nix_realise_image(&args.flake_ref, &args.overrides)
         .context("failed to evaluate or realise the flake output")?;
-    debug!(image = %image_path.display(), "built image");
+    debug!(
+        image = %realised.image_file.display(),
+        toplevel = %realised.toplevel.display(),
+        closure_info = %realised.closure_info.display(),
+        "realised",
+    );
+
+    let boot = boot_inputs_from_toplevel(&realised.toplevel, &realised.closure_info)
+        .context("derive kernel/initrd/cmdline from realised toplevel")?;
 
     let overlay = match args.persist {
-        Some(path) => Overlay::persistent(&image_path, path),
-        None => Overlay::ephemeral(&image_path, id),
+        Some(path) => Overlay::persistent(&realised.image_file, path),
+        None => Overlay::ephemeral(&realised.image_file, id),
     }
     .context("failed to prepare overlay")?;
 
-    launch_vm(overlay, id, args.cpus, args.memory_mib)
+    // GC-root the closure on the host so a host-side `nix-collect-garbage`
+    // can't drop paths the running guest is reading via virtiofs. For
+    // persistent images we also write a sidecar so a later `nixvm load`
+    // can recover toplevel/closureInfo without re-evaluating the flake.
+    let gc_root = match overlay.mode {
+        OverlayMode::Persistent => {
+            write_sidecar(&overlay.path, &realised.toplevel, &realised.closure_info)
+                .context("write image sidecar")?;
+            GcRoot::persistent(&realised.closure_info, &overlay.path)
+                .context("install persistent GC root")?
+        }
+        OverlayMode::Ephemeral => GcRoot::ephemeral(&realised.closure_info, id)
+            .context("install ephemeral GC root")?,
+        OverlayMode::Loaded => unreachable!("run does not produce Loaded overlays"),
+    };
+
+    let result = launch_vm(overlay, &boot, id, args.cpus, args.memory_mib);
+    drop(gc_root);
+    result
 }
 
 /// Boot a previously-saved image (from `nixvm run -p`) in place. Writes
@@ -87,12 +128,41 @@ pub fn load(args: LoadArgs) -> Result<u8> {
     let id = uuid::Uuid::now_v7();
     info!(%id, "starting");
 
-    let overlay = Overlay::load(args.path).context("failed to open image")?;
-    launch_vm(overlay, id, args.cpus, args.memory_mib)
+    let overlay = Overlay::load(args.path.clone()).context("failed to open image")?;
+    let (toplevel, closure_info) = read_sidecar(&overlay.path)?;
+    if !toplevel.exists() {
+        bail!(
+            "{} no longer exists — re-run `nixvm run -p {}` against the original flake to rebuild the closure",
+            toplevel.display(),
+            args.path.display(),
+        );
+    }
+    if !closure_info.exists() {
+        bail!(
+            "{} no longer exists — re-run `nixvm run -p {}` against the original flake to rebuild the closure",
+            closure_info.display(),
+            args.path.display(),
+        );
+    }
+
+    let boot = boot_inputs_from_toplevel(&toplevel, &closure_info)
+        .context("derive kernel/initrd/cmdline from sidecar toplevel")?;
+    let gc_root = GcRoot::persistent(&closure_info, &overlay.path)
+        .context("refresh persistent GC root")?;
+
+    let result = launch_vm(overlay, &boot, id, args.cpus, args.memory_mib);
+    drop(gc_root);
+    result
 }
 
 /// Shared launch path: vmnet, raw TTY, fork, libkrun, wait, cleanup.
-fn launch_vm(overlay: Overlay, id: uuid::Uuid, cpus: u8, mem_mib: u32) -> Result<u8> {
+fn launch_vm(
+    overlay: Overlay,
+    boot: &BootInputs,
+    id: uuid::Uuid,
+    cpus: u8,
+    mem_mib: u32,
+) -> Result<u8> {
     let _span = tracing::info_span!("vm", %id).entered();
 
     // Open vmnet *before* fork. The interface_ref + dispatch queue are
@@ -108,47 +178,173 @@ fn launch_vm(overlay: Overlay, id: uuid::Uuid, cpus: u8, mem_mib: u32) -> Result
     // Saving + restoring with a Drop guard cleans up on any exit path.
     let _tty = RawTerminal::enter();
 
-    let exit_code =
-        fork_and_run_vm(&overlay, &vmnet, cpus, mem_mib).context("failed to launch the VM")?;
+    let exit_code = fork_and_run_vm(&overlay, boot, &vmnet, cpus, mem_mib)
+        .context("failed to launch the VM")?;
     // vmnet drops here, AFTER waitpid → pump thread joins, vmnet_stop_interface fires.
     drop(vmnet);
     drop(overlay);
     Ok(exit_code)
 }
 
-// ────────────────────────── flake ref parsing ──────────────────────────
+// ── boot inputs + sidecar + GC roots ─────────────────────────────────
 
-/// Resolve relative paths to absolute so `builtins.getFlake` doesn't fail
-/// on path-style refs. Pass through everything else unchanged.
-fn canonicalize_flake_uri(uri: &str) -> Result<String> {
-    let stripped = uri.strip_prefix("path:").unwrap_or(uri);
-    let looks_like_path = stripped.starts_with("./")
-        || stripped.starts_with("../")
-        || stripped == "."
-        || stripped == ".."
-        || stripped.starts_with('/');
-    if !looks_like_path {
-        return Ok(uri.to_string());
-    }
-    let abs = fs::canonicalize(stripped)
-        .with_context(|| format!("could not canonicalize path-style flake ref `{uri}`"))?;
-    Ok(format!("path:{}", abs.display()))
+/// Derive `BootInputs` from a realised `system.build.toplevel`. NixOS
+/// stages the artifacts at well-known names inside the toplevel directory
+/// (`kernel`, `initrd` are symlinks; `kernel-params` is a flat file with
+/// `boot.kernelParams` joined by spaces) — same pattern the UKI build
+/// reads from in `nixos/modules/system/boot/uki.nix`.
+fn boot_inputs_from_toplevel(toplevel: &Path, closure_info: &Path) -> Result<BootInputs> {
+    let kernel = fs::read_link(toplevel.join("kernel"))
+        .with_context(|| format!("readlink {}/kernel", toplevel.display()))?;
+    let initrd = fs::read_link(toplevel.join("initrd"))
+        .with_context(|| format!("readlink {}/initrd", toplevel.display()))?;
+    let kernel_params = fs::read_to_string(toplevel.join("kernel-params"))
+        .with_context(|| format!("read {}/kernel-params", toplevel.display()))?
+        .trim()
+        .to_string();
+    // Mirrors NixOS UKI cmdline (`init=$toplevel/init <kernelParams>`)
+    // plus the `regInfo=` channel qemu-vm.nix uses to deliver the
+    // closure registration file path to the guest.
+    let cmdline = format!(
+        "init={}/init {} regInfo={}/registration",
+        toplevel.display(),
+        kernel_params,
+        closure_info.display(),
+    );
+    Ok(BootInputs {
+        kernel,
+        initrd,
+        cmdline,
+    })
 }
 
-fn split_flake_ref(s: &str) -> Result<(String, String)> {
-    if s.is_empty() {
-        bail!("flake ref is empty");
-    }
-    // Split on the LAST `#` to allow URIs that contain `#` in lockless params
-    // (rare but real). `git+ssh://...?ref=foo#attr` still parses correctly.
-    // No `#` → default to `nixosConfigurations.default`.
-    match s.rsplit_once('#') {
-        Some((uri, attr)) if !uri.is_empty() && !attr.is_empty() => {
-            Ok((uri.to_string(), attr.to_string()))
+/// `<image>.nixvm` next to a persistent image. Two lines, `key path` each;
+/// no JSON to keep the dependency footprint zero.
+fn sidecar_path(image: &Path) -> PathBuf {
+    let mut p = image.as_os_str().to_owned();
+    p.push(".nixvm");
+    PathBuf::from(p)
+}
+
+fn write_sidecar(image: &Path, toplevel: &Path, closure_info: &Path) -> Result<()> {
+    let body = format!(
+        "toplevel {}\nclosureInfo {}\n",
+        toplevel.display(),
+        closure_info.display(),
+    );
+    let p = sidecar_path(image);
+    fs::write(&p, body).with_context(|| format!("write {}", p.display()))
+}
+
+fn read_sidecar(image: &Path) -> Result<(PathBuf, PathBuf)> {
+    let p = sidecar_path(image);
+    let body = fs::read_to_string(&p)
+        .with_context(|| format!("read {} (no sidecar — was this image saved by `nixvm run -p`?)", p.display()))?;
+    let mut toplevel: Option<PathBuf> = None;
+    let mut closure_info: Option<PathBuf> = None;
+    for line in body.lines() {
+        let mut it = line.splitn(2, ' ');
+        match (it.next(), it.next()) {
+            (Some("toplevel"), Some(v)) => toplevel = Some(PathBuf::from(v)),
+            (Some("closureInfo"), Some(v)) => closure_info = Some(PathBuf::from(v)),
+            _ => {}
         }
-        Some(_) => bail!("invalid flake ref `{s}`: expected `<flake>[#<attr-path>]`"),
-        None => Ok((s.to_string(), "nixosConfigurations.default".to_string())),
     }
+    Ok((
+        toplevel.ok_or_else(|| anyhow!("{}: missing `toplevel`", p.display()))?,
+        closure_info.ok_or_else(|| anyhow!("{}: missing `closureInfo`", p.display()))?,
+    ))
+}
+
+fn xdg_state_home() -> PathBuf {
+    if let Ok(v) = std::env::var("XDG_STATE_HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".local/state")
+}
+
+/// Stable per-image directory name for persistent GC roots. Hashes the
+/// canonical absolute image path so two `nixvm load PATH` invocations
+/// end up at the same GC root, regardless of CWD.
+fn persistent_root_dir(image: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let abs = std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    abs.hash(&mut hasher);
+    xdg_state_home()
+        .join("nixvm/roots")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+/// Holds an indirect GC root in `dir` pointing at the realised closureInfo.
+/// Rooting closureInfo transitively roots the entire system closure
+/// (closureInfo's `references` in the store metadata include every path
+/// it lists in `registration`), so `nix-collect-garbage` on the host
+/// can't drop paths the running guest reads via virtiofs.
+///
+/// Ephemeral roots are removed on `Drop`; persistent ones are kept so a
+/// later `nixvm load` doesn't have to re-evaluate the flake.
+struct GcRoot {
+    dir: PathBuf,
+    ephemeral: bool,
+}
+
+impl GcRoot {
+    fn ephemeral(closure_info: &Path, id: uuid::Uuid) -> Result<Self> {
+        let dir = xdg_state_home().join(format!("nixvm/transient/{id}"));
+        add_gc_root(closure_info, &dir)?;
+        Ok(Self {
+            dir,
+            ephemeral: true,
+        })
+    }
+
+    fn persistent(closure_info: &Path, image: &Path) -> Result<Self> {
+        let dir = persistent_root_dir(image);
+        add_gc_root(closure_info, &dir)?;
+        Ok(Self {
+            dir,
+            ephemeral: false,
+        })
+    }
+}
+
+impl Drop for GcRoot {
+    fn drop(&mut self) {
+        if self.ephemeral {
+            // The user-space symlink disappears; the indirect root in
+            // /nix/var/nix/gcroots/auto becomes dangling and is cleaned
+            // up by the daemon on the next GC pass.
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+fn add_gc_root(closure_info: &Path, dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
+    let link = dir.join("closure-info");
+    // `nix-store --realise … --add-root LINK --indirect`: realises the
+    // path (no-op if already valid), creates LINK as a symlink to the
+    // realised /nix/store path, and registers an indirect root in
+    // /nix/var/nix/gcroots/auto pointing at LINK. We can't do this
+    // through the C API — `nix_store_realise` exists but no GC-root
+    // function does, so we shell out.
+    let status = std::process::Command::new("nix-store")
+        .arg("--realise")
+        .arg(closure_info)
+        .arg("--add-root")
+        .arg(&link)
+        .arg("--indirect")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("spawn nix-store --add-root")?;
+    if !status.success() {
+        bail!("nix-store --add-root exited with {status}");
+    }
+    Ok(())
 }
 
 // ─────────────────────────── Nix C API glue ───────────────────────────
@@ -216,17 +412,23 @@ fn read_string(
     String::from_utf8(buf).context("nix returned non-UTF8 string")
 }
 
-/// Drives the full eval+realise pipeline. Returns the realised store path
-/// of the resulting raw EFI disk image.
-fn nix_realise_image(flake_uri: &str, attr_path: &str) -> Result<PathBuf> {
+/// Drives the full eval+realise pipeline. Returns every realised store
+/// path the launcher needs: the raw disk image, `system.build.toplevel`
+/// (kernel/initrd/init/kernel-params live inside it), and the
+/// `closureInfo` registration directory.
+///
+/// Uses the libflake C API end-to-end: parse the user's flake-ref against
+/// $PWD as base directory (so `./foo` resolves like `nix build`), apply
+/// any `--override-input` entries during virtual locking, then walk the
+/// resulting outputs tree to extract drvPath/outPath/fileName.
+fn nix_realise_image(flake_uri: &str, overrides: &[(String, String)]) -> Result<Realised> {
     let ctx = NixCtx::new()?;
 
     unsafe {
         nix_sys::nix_libutil_init(ctx.raw);
         ctx.check().context("nix_libutil_init")?;
 
-        // Enable flakes (for `builtins.getFlake`) before libstore/libexpr
-        // pick up settings.
+        // Enable flakes before libstore/libexpr pick up settings.
         let key = CString::new("experimental-features").unwrap();
         let val = CString::new("nix-command flakes").unwrap();
         nix_sys::nix_setting_set(ctx.raw, key.as_ptr(), val.as_ptr());
@@ -248,7 +450,6 @@ fn nix_realise_image(flake_uri: &str, attr_path: &str) -> Result<PathBuf> {
     }
     let _store_guard = scopeguard(|| unsafe { nix_sys::nix_store_free(store) });
 
-    // Build the eval state with flake support so `builtins.getFlake` exists.
     let flake_settings = unsafe { nix_sys::nix_flake_settings_new(ctx.raw) };
     ctx.check().context("nix_flake_settings_new")?;
     if flake_settings.is_null() {
@@ -256,6 +457,14 @@ fn nix_realise_image(flake_uri: &str, attr_path: &str) -> Result<PathBuf> {
     }
     let _flake_settings_guard =
         scopeguard(|| unsafe { nix_sys::nix_flake_settings_free(flake_settings) });
+
+    let fetch_settings = unsafe { nix_sys::nix_fetchers_settings_new(ctx.raw) };
+    ctx.check().context("nix_fetchers_settings_new")?;
+    if fetch_settings.is_null() {
+        bail!("nix_fetchers_settings_new returned NULL");
+    }
+    let _fetch_settings_guard =
+        scopeguard(|| unsafe { nix_sys::nix_fetchers_settings_free(fetch_settings) });
 
     let builder = unsafe { nix_sys::nix_eval_state_builder_new(ctx.raw, store) };
     ctx.check().context("nix_eval_state_builder_new")?;
@@ -280,81 +489,303 @@ fn nix_realise_image(flake_uri: &str, attr_path: &str) -> Result<PathBuf> {
     }
     let _state_guard = scopeguard(|| unsafe { nix_sys::nix_state_free(state) });
 
-    // Evaluate the NixOS configuration's image derivation, pulling out
-    // drvPath (to realise) and the absolute path of the inner raw file.
-    // `system.build.image` is a directory derivation; `image.fileName` is the
-    // basename of the raw image inside it. Computing the full path here
-    // avoids needing the user to wrap the output in a `runCommand` symlink.
-    let expr = CString::new(format!(
-        r#"let cfg = (builtins.getFlake "{uri}").{attr};
-               img = cfg.config.system.build.image;
-            in {{ drvPath = img.drvPath;
-                  outPath = "${{img.outPath}}/${{cfg.config.image.fileName}}"; }}"#,
-        uri = flake_uri.escape_default(),
-        attr = attr_path,
-    ))
-    .unwrap();
-    let cwd = CString::new(".").unwrap();
+    // Parse-flags' base directory makes nix resolve user-supplied relative
+    // paths (e.g. `./examples/nixelium`) against $PWD, exactly like `nix build`.
+    let parse_flags =
+        unsafe { nix_sys::nix_flake_reference_parse_flags_new(ctx.raw, flake_settings) };
+    ctx.check().context("nix_flake_reference_parse_flags_new")?;
+    if parse_flags.is_null() {
+        bail!("nix_flake_reference_parse_flags_new returned NULL");
+    }
+    let _parse_flags_guard =
+        scopeguard(|| unsafe { nix_sys::nix_flake_reference_parse_flags_free(parse_flags) });
 
-    let value = unsafe { nix_sys::nix_alloc_value(ctx.raw, state) };
-    ctx.check().context("nix_alloc_value")?;
-    let _value_guard = scopeguard(|| unsafe {
-        let _ = nix_sys::nix_value_decref(ctx.raw, value);
+    let cwd = std::env::current_dir().context("getcwd")?;
+    let cwd_str = cwd.to_str().context("cwd not UTF-8")?;
+    let cwd_c = CString::new(cwd_str).unwrap();
+    unsafe {
+        nix_sys::nix_flake_reference_parse_flags_set_base_directory(
+            ctx.raw,
+            parse_flags,
+            cwd_c.as_ptr(),
+            cwd_str.len(),
+        );
+    }
+    ctx.check().context("set base directory on parse flags")?;
+
+    let (flake_ref, fragment) =
+        parse_flake_ref(&ctx, fetch_settings, flake_settings, parse_flags, flake_uri)
+            .with_context(|| format!("parse flake ref `{flake_uri}`"))?;
+    let _flake_ref_guard = scopeguard(|| unsafe { nix_sys::nix_flake_reference_free(flake_ref) });
+
+    // Match the old default: bare flake-ref (no `#`) → `nixosConfigurations.default`.
+    let attr_path = if fragment.is_empty() {
+        "nixosConfigurations.default".to_string()
+    } else {
+        fragment
+    };
+
+    // Lock flags: virtual mode (lock in memory, never write to disk) plus
+    // any `--override-input` entries.
+    let lock_flags = unsafe { nix_sys::nix_flake_lock_flags_new(ctx.raw, flake_settings) };
+    ctx.check().context("nix_flake_lock_flags_new")?;
+    if lock_flags.is_null() {
+        bail!("nix_flake_lock_flags_new returned NULL");
+    }
+    let _lock_flags_guard =
+        scopeguard(|| unsafe { nix_sys::nix_flake_lock_flags_free(lock_flags) });
+
+    unsafe { nix_sys::nix_flake_lock_flags_set_mode_virtual(ctx.raw, lock_flags) };
+    ctx.check()
+        .context("nix_flake_lock_flags_set_mode_virtual")?;
+
+    // Override flake refs must outlive the lock flags struct (which only
+    // borrows them). `OverrideRefs` owns them and frees on drop at the end
+    // of this function.
+    let mut override_refs = OverrideRefs(Vec::new());
+    for (key, uri) in overrides {
+        let (or_ref, _frag) =
+            parse_flake_ref(&ctx, fetch_settings, flake_settings, parse_flags, uri)
+                .with_context(|| format!("parse override `{key} {uri}`"))?;
+        override_refs.0.push(or_ref);
+        let key_c = CString::new(key.as_str()).unwrap();
+        unsafe {
+            nix_sys::nix_flake_lock_flags_add_input_override(
+                ctx.raw,
+                lock_flags,
+                key_c.as_ptr(),
+                or_ref,
+            );
+        }
+        ctx.check()
+            .with_context(|| format!("add override `{key} {uri}`"))?;
+    }
+
+    let locked = unsafe {
+        nix_sys::nix_flake_lock(
+            ctx.raw,
+            fetch_settings,
+            flake_settings,
+            state,
+            lock_flags,
+            flake_ref,
+        )
+    };
+    ctx.check().context("nix_flake_lock")?;
+    if locked.is_null() {
+        bail!("nix_flake_lock returned NULL");
+    }
+    let _locked_guard = scopeguard(|| unsafe { nix_sys::nix_locked_flake_free(locked) });
+
+    let outputs = unsafe {
+        nix_sys::nix_locked_flake_get_output_attrs(ctx.raw, flake_settings, state, locked)
+    };
+    ctx.check().context("nix_locked_flake_get_output_attrs")?;
+    if outputs.is_null() {
+        bail!("nix_locked_flake_get_output_attrs returned NULL");
+    }
+    let _outputs_guard = scopeguard(|| unsafe {
+        let _ = nix_sys::nix_value_decref(ctx.raw, outputs);
     });
+    unsafe { nix_sys::nix_value_force(ctx.raw, state, outputs) };
+    ctx.check().context("force outputs")?;
 
-    unsafe {
-        nix_sys::nix_expr_eval_from_string(ctx.raw, state, expr.as_ptr(), cwd.as_ptr(), value);
-    }
-    ctx.check().context("nix_expr_eval_from_string")?;
-    unsafe {
-        nix_sys::nix_value_force(ctx.raw, state, value);
-    }
-    ctx.check().context("nix_value_force")?;
+    // Walk the outputs tree for every path the launch will need:
+    //   - `system.build.image.{drvPath,outPath}` + `image.fileName` →
+    //     the raw root-fs image we copy to the overlay.
+    //   - `system.build.toplevel.outPath` → host-side directory that
+    //     stages `kernel`/`initrd`/`init`/`kernel-params` (read by
+    //     [`boot_inputs_from_toplevel`]).
+    //   - `system.build.closureInfo.{drvPath,outPath}` → the registration
+    //     file pointed to by `regInfo=` on the kernel cmdline.
+    let img_drv_path = read_path_string(
+        &ctx,
+        state,
+        outputs,
+        &format!("{attr_path}.config.system.build.image.drvPath"),
+    )?;
+    let img_out_path = read_path_string(
+        &ctx,
+        state,
+        outputs,
+        &format!("{attr_path}.config.system.build.image.outPath"),
+    )?;
+    let file_name = read_path_string(
+        &ctx,
+        state,
+        outputs,
+        &format!("{attr_path}.config.image.fileName"),
+    )?;
+    let toplevel_out = read_path_string(
+        &ctx,
+        state,
+        outputs,
+        &format!("{attr_path}.config.system.build.toplevel.outPath"),
+    )?;
+    let closure_info_drv = read_path_string(
+        &ctx,
+        state,
+        outputs,
+        &format!("{attr_path}.config.system.build.closureInfo.drvPath"),
+    )?;
+    let closure_info_out = read_path_string(
+        &ctx,
+        state,
+        outputs,
+        &format!("{attr_path}.config.system.build.closureInfo.outPath"),
+    )?;
 
-    let drv_path = read_attr_string(&ctx, state, value, "drvPath")?;
-    let out_path = read_attr_string(&ctx, state, value, "outPath")?;
+    // Realise both drvs. Realising closureInfo pulls toplevel in as an
+    // input dep, so we get kernel/initrd/init transitively.
+    realise_drv(&ctx, store, &img_drv_path).context("realise image drv")?;
+    realise_drv(&ctx, store, &closure_info_drv).context("realise closureInfo drv")?;
 
-    // Parse the drv path and realise it.
-    let drv_cstr = CString::new(drv_path.clone()).unwrap();
+    Ok(Realised {
+        image_file: PathBuf::from(format!("{img_out_path}/{file_name}")),
+        toplevel: PathBuf::from(toplevel_out),
+        closure_info: PathBuf::from(closure_info_out),
+    })
+}
+
+fn realise_drv(ctx: &NixCtx, store: *mut nix_sys::Store, drv_path: &str) -> Result<()> {
+    let drv_cstr = CString::new(drv_path).unwrap();
     let store_path = unsafe { nix_sys::nix_store_parse_path(ctx.raw, store, drv_cstr.as_ptr()) };
     ctx.check().context("nix_store_parse_path")?;
     if store_path.is_null() {
         bail!("nix_store_parse_path returned NULL for {drv_path}");
     }
-    let _path_guard = scopeguard(|| unsafe { nix_sys::nix_store_path_free(store_path) });
-
-    // Realise (build) the derivation. We don't need the callback's output
-    // paths since we already evaluated `outPath`.
+    let _g = scopeguard(|| unsafe { nix_sys::nix_store_path_free(store_path) });
     unsafe {
         nix_sys::nix_store_realise(ctx.raw, store, store_path, ptr::null_mut(), None);
     }
     ctx.check().context("nix_store_realise")?;
-
-    Ok(PathBuf::from(out_path))
+    Ok(())
 }
 
-fn read_attr_string(
+/// Owning collection of `nix_flake_reference *` pointers used as override
+/// inputs; the lock flags borrow them, so they must outlive locking.
+struct OverrideRefs(Vec<*mut nix_sys::nix_flake_reference>);
+impl Drop for OverrideRefs {
+    fn drop(&mut self) {
+        for r in &self.0 {
+            unsafe { nix_sys::nix_flake_reference_free(*r) };
+        }
+    }
+}
+
+/// Wrap `nix_flake_reference_and_fragment_from_string`. Returns a flake
+/// reference (caller must `nix_flake_reference_free`) plus the `#fragment`
+/// string (empty if the URI had none).
+fn parse_flake_ref(
+    ctx: &NixCtx,
+    fetch_settings: *mut nix_sys::nix_fetchers_settings,
+    flake_settings: *mut nix_sys::nix_flake_settings,
+    parse_flags: *mut nix_sys::nix_flake_reference_parse_flags,
+    uri: &str,
+) -> Result<(*mut nix_sys::nix_flake_reference, String)> {
+    let mut fragment_buf: Vec<u8> = Vec::new();
+    let mut out: *mut nix_sys::nix_flake_reference = ptr::null_mut();
+    let uri_c = CString::new(uri).context("flake URI contains a NUL byte")?;
+    unsafe {
+        nix_sys::nix_flake_reference_and_fragment_from_string(
+            ctx.raw,
+            fetch_settings,
+            flake_settings,
+            parse_flags,
+            uri_c.as_ptr(),
+            uri.len(),
+            &mut out,
+            Some(collect_string_cb),
+            &mut fragment_buf as *mut _ as *mut c_void,
+        );
+    }
+    ctx.check()
+        .with_context(|| format!("nix_flake_reference_and_fragment_from_string({uri})"))?;
+    if out.is_null() {
+        bail!("nix_flake_reference_and_fragment_from_string returned NULL for `{uri}`");
+    }
+    let fragment = String::from_utf8(fragment_buf).context("flake fragment not UTF-8")?;
+    Ok((out, fragment))
+}
+
+/// Walk a dotted attr path under `root` and return a fresh value handle.
+/// Caller must `nix_value_decref` the result. Empty / single-segment paths
+/// both work; intermediate refs are decref'd as we descend.
+fn walk_attrs(
     ctx: &NixCtx,
     state: *mut nix_sys::EvalState,
-    parent: *mut nix_sys::nix_value,
-    name: &str,
-) -> Result<String> {
-    let cname = CString::new(name).unwrap();
-    let attr = unsafe { nix_sys::nix_get_attr_byname(ctx.raw, parent, state, cname.as_ptr()) };
-    ctx.check()
-        .with_context(|| format!("nix_get_attr_byname({name})"))?;
-    if attr.is_null() {
-        bail!("attribute `{name}` missing");
+    root: *mut nix_sys::nix_value,
+    path: &str,
+) -> Result<*mut nix_sys::nix_value> {
+    let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        bail!("walk_attrs: empty path");
     }
-    let _attr_guard = scopeguard(|| unsafe {
-        let _ = nix_sys::nix_value_decref(ctx.raw, attr);
+    let mut cur = root;
+    let mut owned: *mut nix_sys::nix_value = ptr::null_mut();
+    for seg in segments {
+        let cseg = CString::new(seg).unwrap();
+        let next = unsafe { nix_sys::nix_get_attr_byname(ctx.raw, cur, state, cseg.as_ptr()) };
+        if let Err(err) = ctx
+            .check()
+            .with_context(|| format!("get `{seg}` while walking `{path}`"))
+        {
+            if !owned.is_null() {
+                unsafe {
+                    let _ = nix_sys::nix_value_decref(ctx.raw, owned);
+                }
+            }
+            return Err(err);
+        }
+        if next.is_null() {
+            if !owned.is_null() {
+                unsafe {
+                    let _ = nix_sys::nix_value_decref(ctx.raw, owned);
+                }
+            }
+            bail!("attribute `{seg}` missing while walking `{path}`");
+        }
+        unsafe { nix_sys::nix_value_force(ctx.raw, state, next) };
+        if let Err(err) = ctx
+            .check()
+            .with_context(|| format!("force `{seg}` while walking `{path}`"))
+        {
+            unsafe {
+                let _ = nix_sys::nix_value_decref(ctx.raw, next);
+            }
+            if !owned.is_null() {
+                unsafe {
+                    let _ = nix_sys::nix_value_decref(ctx.raw, owned);
+                }
+            }
+            return Err(err);
+        }
+        if !owned.is_null() {
+            unsafe {
+                let _ = nix_sys::nix_value_decref(ctx.raw, owned);
+            }
+        }
+        owned = next;
+        cur = next;
+    }
+    Ok(owned)
+}
+
+/// Walk a dotted attr path and read the string value at the leaf.
+fn read_path_string(
+    ctx: &NixCtx,
+    state: *mut nix_sys::EvalState,
+    root: *mut nix_sys::nix_value,
+    path: &str,
+) -> Result<String> {
+    let val = walk_attrs(ctx, state, root, path)?;
+    let _g = scopeguard(|| unsafe {
+        let _ = nix_sys::nix_value_decref(ctx.raw, val);
     });
-    unsafe { nix_sys::nix_value_force(ctx.raw, state, attr) };
-    ctx.check().with_context(|| format!("force {name}"))?;
     read_string(ctx, |ctx_raw, cb, ud| unsafe {
-        nix_sys::nix_get_string(ctx_raw, attr, cb, ud)
+        nix_sys::nix_get_string(ctx_raw, val, cb, ud)
     })
-    .with_context(|| format!("read {name}"))
+    .with_context(|| format!("read string at `{path}`"))
 }
 
 // Minimal scope-guard helper (avoids pulling in a crate).
@@ -839,7 +1270,13 @@ use std::os::fd::FromRawFd;
 
 // ─────────────────────────── libkrun + fork ───────────────────────────
 
-fn fork_and_run_vm(overlay: &Overlay, vmnet: &Vmnet, cpus: u8, mem_mib: u32) -> Result<u8> {
+fn fork_and_run_vm(
+    overlay: &Overlay,
+    boot: &BootInputs,
+    vmnet: &Vmnet,
+    cpus: u8,
+    mem_mib: u32,
+) -> Result<u8> {
     // We deliberately do NOT call krun_create_ctx in the parent: libkrun's
     // krun_start_enter() never returns and exit()s the process. Doing all
     // libkrun calls in the child means the parent retains its identity for
@@ -859,6 +1296,7 @@ fn fork_and_run_vm(overlay: &Overlay, vmnet: &Vmnet, cpus: u8, mem_mib: u32) -> 
         // the parent can surface it.
         if let Err(err) = configure_and_start_vm(
             overlay.path.as_path(),
+            boot,
             cpus,
             mem_mib,
             net_fd,
@@ -905,6 +1343,7 @@ fn fork_and_run_vm(overlay: &Overlay, vmnet: &Vmnet, cpus: u8, mem_mib: u32) -> 
 
 fn configure_and_start_vm(
     overlay_path: &Path,
+    boot: &BootInputs,
     cpus: u8,
     mem_mib: u32,
     net_fd: RawFd,
@@ -929,10 +1368,32 @@ fn configure_and_start_vm(
         "krun_set_vm_config",
     )?;
 
-    let firmware = CString::new(NIXVM_EDK2_PATH).unwrap();
+    // Direct kernel boot — no UKI, no firmware. NixOS aarch64 emits an
+    // uncompressed `Image` (raw kernel) at `system.build.kernel/Image`
+    // and a separate initrd at `system.build.initialRamdisk/initrd`;
+    // libkrun loads both at the right physical addresses for ARM64 and
+    // hands the cmdline to the kernel. KRUN_KERNEL_FORMAT_RAW matches the
+    // uncompressed Image format.
+    let kernel_path = CString::new(boot.kernel.to_str().context("kernel path not UTF-8")?).unwrap();
+    let initrd_path = CString::new(boot.initrd.to_str().context("initrd path not UTF-8")?).unwrap();
+    let cmdline = CString::new(boot.cmdline.as_str()).context("cmdline contains NUL byte")?;
+    debug!(
+        kernel = %boot.kernel.display(),
+        initrd = %boot.initrd.display(),
+        cmdline = %boot.cmdline,
+        "krun_set_kernel",
+    );
     krun_check(
-        unsafe { krun_set_firmware(ctx, firmware.as_ptr()) },
-        "krun_set_firmware",
+        unsafe {
+            krun_set_kernel(
+                ctx,
+                kernel_path.as_ptr(),
+                KRUN_KERNEL_FORMAT_RAW,
+                initrd_path.as_ptr(),
+                cmdline.as_ptr(),
+            )
+        },
+        "krun_set_kernel",
     )?;
 
     // Root disk: the ephemeral overlay (raw image). Using the simpler
