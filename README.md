@@ -70,6 +70,15 @@ ordinary outbound traffic Just Work. No inbound connections.
 in one place. `examples/minimal/module.nix` shows the minimum on top
 (image identity + stateVersion).
 
+By default, the guest module builds a 256M single-partition image. Raise
+that for images that need more writable guest state:
+
+```nix
+{
+  nixvm.guest.rootSize = "4G";
+}
+```
+
 Out-of-tree configurations can import `nixvm.nixosModules.guest`
 directly. For example,
 [`nixelium`](https://github.com/rvolosatovs/nixelium) exposes a

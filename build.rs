@@ -23,6 +23,28 @@ fn main() {
         .map(|p| format!("-I{}", p.display()))
         .collect();
 
+    // C++ shim: calls `Config::set` on a `nix_fetchers_settings`
+    // instance, working around the missing per-instance setter in the
+    // public C API. Needs the C++ headers from nix-fetchers/-store/-util
+    // *and* the `*_internal.h*` headers from nix-fetchers-c/nix-util-c.
+    let nix_fetchers = probe("nix-fetchers");
+    let nix_fetchers_c = probe("nix-fetchers-c");
+    let nix_util_c = probe("nix-util-c");
+    let mut shim = cc::Build::new();
+    shim.cpp(true)
+        .std("c++23")
+        .file("c_src/nix_setting_shim.cc");
+    for p in nix_fetchers
+        .include_paths
+        .iter()
+        .chain(nix_fetchers_c.include_paths.iter())
+        .chain(nix_util_c.include_paths.iter())
+    {
+        shim.include(p);
+    }
+    shim.compile("nixvm_setting_shim");
+    println!("cargo:rerun-if-changed=c_src/nix_setting_shim.cc");
+
     let bindings = bindgen::Builder::default()
         .header_contents(
             "nix_wrapper.h",

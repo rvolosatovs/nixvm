@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v7"] }
 
 [build-dependencies]
 bindgen = "0.71"
+cc = "1"
 pkg-config = "0.3"
 
 [profile.release]

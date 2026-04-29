@@ -38,8 +38,11 @@ enum Command {
         override_input: Vec<String>,
 
         /// Set a Nix configuration option. Repeatable. Same syntax as
-        /// `nix --option NAME VALUE` (e.g. `--option tarball-ttl 0`,
-        /// `--option substitute false`, `--option connect-timeout 5`).
+        /// `nix --option NAME VALUE` (e.g. `--option substitute false`,
+        /// `--option connect-timeout 5`). Most `libfetchers` options
+        /// (e.g. `tarball-ttl`) are not reachable through this path on
+        /// macOS — use the dedicated flag (e.g. `--tarball-ttl`) for
+        /// those.
         #[arg(
             long = "option",
             value_names = ["NAME", "VALUE"],
@@ -47,6 +50,12 @@ enum Command {
             action = clap::ArgAction::Append,
         )]
         option: Vec<String>,
+
+        /// Tarball-cache TTL in seconds. Mirrors `nix --tarball-ttl`.
+        /// Pass `0` to force re-fetching cached flake inputs (e.g.
+        /// `github:` refs) on every invocation.
+        #[arg(long = "tarball-ttl", value_name = "SECONDS")]
+        tarball_ttl: Option<u32>,
 
         /// Save the image to PATH instead of an ephemeral tempfile.
         /// Resume later with `nixvm load PATH`.
@@ -92,6 +101,7 @@ fn main() -> ExitCode {
             flake_ref,
             override_input,
             option,
+            tarball_ttl,
             persist,
             cpus,
             memory_mib,
@@ -105,6 +115,7 @@ fn main() -> ExitCode {
                     flake_ref,
                     overrides,
                     settings,
+                    tarball_ttl,
                     persist,
                     cpus,
                     memory_mib,

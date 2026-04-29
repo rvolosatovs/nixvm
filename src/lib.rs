@@ -40,6 +40,16 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/sys_bindings.rs"));
 }
 
+// Per-instance fetcher-settings setter. See `c_src/nix_setting_shim.cc`.
+unsafe extern "C" {
+    fn nixvm_fetchers_settings_set(
+        ctx: *mut nix_sys::nix_c_context,
+        settings: *mut nix_sys::nix_fetchers_settings,
+        name: *const c_char,
+        value: *const c_char,
+    ) -> nix_sys::nix_err;
+}
+
 #[derive(Debug, Clone)]
 pub struct RunArgs {
     pub flake_ref: String,
@@ -48,8 +58,13 @@ pub struct RunArgs {
     pub overrides: Vec<(String, String)>,
     /// `(name, value)` pairs from `--option NAME VALUE`, applied via
     /// `nix_setting_set` before libstore/libexpr init. Mirrors
-    /// `nix --option`.
+    /// `nix --option`. Settings the C API can't reach (notably most
+    /// `libfetchers` options on macOS) are warned about and skipped
+    /// rather than fatal — same behavior as `nix --option <unknown>`.
     pub settings: Vec<(String, String)>,
+    /// `--tarball-ttl SECONDS`. Applied to the `nix_fetchers_settings`
+    /// instance used for flake locking. Mirrors `nix --tarball-ttl`.
+    pub tarball_ttl: Option<u32>,
     /// If `Some`, copy the image to this path and keep it across exit.
     /// Resume later with `nixvm load <path>`.
     pub persist: Option<PathBuf>,
@@ -87,8 +102,13 @@ pub fn run(args: RunArgs) -> Result<u8> {
     info!(%id, "starting");
 
     debug!(flake = %args.flake_ref, "evaluating + realising flake output");
-    let realised = nix_realise_image(&args.flake_ref, &args.overrides, &args.settings)
-        .context("failed to evaluate or realise the flake output")?;
+    let realised = nix_realise_image(
+        &args.flake_ref,
+        &args.overrides,
+        &args.settings,
+        args.tarball_ttl,
+    )
+    .context("failed to evaluate or realise the flake output")?;
     debug!(
         image = %realised.image_file.display(),
         toplevel = %realised.toplevel.display(),
@@ -116,8 +136,9 @@ pub fn run(args: RunArgs) -> Result<u8> {
             GcRoot::persistent(&realised.closure_info, &overlay.path)
                 .context("install persistent GC root")?
         }
-        OverlayMode::Ephemeral => GcRoot::ephemeral(&realised.closure_info, id)
-            .context("install ephemeral GC root")?,
+        OverlayMode::Ephemeral => {
+            GcRoot::ephemeral(&realised.closure_info, id).context("install ephemeral GC root")?
+        }
         OverlayMode::Loaded => unreachable!("run does not produce Loaded overlays"),
     };
 
@@ -151,8 +172,8 @@ pub fn load(args: LoadArgs) -> Result<u8> {
 
     let boot = boot_inputs_from_toplevel(&toplevel, &closure_info)
         .context("derive kernel/initrd/cmdline from sidecar toplevel")?;
-    let gc_root = GcRoot::persistent(&closure_info, &overlay.path)
-        .context("refresh persistent GC root")?;
+    let gc_root =
+        GcRoot::persistent(&closure_info, &overlay.path).context("refresh persistent GC root")?;
 
     let result = launch_vm(overlay, &boot, id, args.cpus, args.memory_mib);
     drop(gc_root);
@@ -242,8 +263,12 @@ fn write_sidecar(image: &Path, toplevel: &Path, closure_info: &Path) -> Result<(
 
 fn read_sidecar(image: &Path) -> Result<(PathBuf, PathBuf)> {
     let p = sidecar_path(image);
-    let body = fs::read_to_string(&p)
-        .with_context(|| format!("read {} (no sidecar — was this image saved by `nixvm run -p`?)", p.display()))?;
+    let body = fs::read_to_string(&p).with_context(|| {
+        format!(
+            "read {} (no sidecar — was this image saved by `nixvm run -p`?)",
+            p.display()
+        )
+    })?;
     let mut toplevel: Option<PathBuf> = None;
     let mut closure_info: Option<PathBuf> = None;
     for line in body.lines() {
@@ -429,6 +454,7 @@ fn nix_realise_image(
     flake_uri: &str,
     overrides: &[(String, String)],
     settings: &[(String, String)],
+    tarball_ttl: Option<u32>,
 ) -> Result<Realised> {
     let ctx = NixCtx::new()?;
 
@@ -443,17 +469,23 @@ fn nix_realise_image(
         ctx.check().context("enable experimental flakes feature")?;
 
         // User-supplied `--option NAME VALUE`. Applied here, before
-        // libstore/libexpr init, so settings like `tarball-ttl`,
-        // `substitute`, `connect-timeout` reach the same code path
-        // `nix --option NAME VALUE` uses.
+        // libstore/libexpr init, against `globalConfig`. Reaches
+        // settings registered by libutil/libstore/libexpr/libflake
+        // (e.g. `connect-timeout`, `substitute`, `accept-flake-config`).
+        // libfetchers settings (`tarball-ttl`, `access-tokens`, etc.)
+        // are not registered with `globalConfig` from the C API on
+        // macOS — for those, see `--tarball-ttl` and the per-instance
+        // `nixvm_fetchers_settings_set` path below. Unknown/unreachable
+        // names warn and are skipped, matching `nix --option <unknown>`.
         for (name, value) in settings {
             let key = CString::new(name.as_str())
                 .with_context(|| format!("--option name `{name}` contains a NUL byte"))?;
             let val = CString::new(value.as_str())
                 .with_context(|| format!("--option value for `{name}` contains a NUL byte"))?;
             nix_sys::nix_setting_set(ctx.raw, key.as_ptr(), val.as_ptr());
-            ctx.check()
-                .with_context(|| format!("set nix option `{name} = {value}`"))?;
+            if let Err(e) = ctx.check() {
+                warn!("ignoring `--option {name} {value}`: {e:#}");
+            }
         }
 
         nix_sys::nix_libstore_init(ctx.raw);
@@ -487,6 +519,15 @@ fn nix_realise_image(
     }
     let _fetch_settings_guard =
         scopeguard(|| unsafe { nix_sys::nix_fetchers_settings_free(fetch_settings) });
+
+    if let Some(ttl) = tarball_ttl {
+        let key = CString::new("tarball-ttl").unwrap();
+        let val = CString::new(ttl.to_string()).unwrap();
+        unsafe {
+            nixvm_fetchers_settings_set(ctx.raw, fetch_settings, key.as_ptr(), val.as_ptr());
+        }
+        ctx.check().context("apply --tarball-ttl")?;
+    }
 
     let builder = unsafe { nix_sys::nix_eval_state_builder_new(ctx.raw, store) };
     ctx.check().context("nix_eval_state_builder_new")?;
