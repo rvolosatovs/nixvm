@@ -23,6 +23,7 @@ rustix = { version = "1", features = ["termios", "process"] }
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7"] }
 
 [build-dependencies]
 bindgen = "0.71"

@@ -18,7 +18,7 @@ CARGO_ENV := PKG_CONFIG_PATH=$(PKG_CONF):$$PKG_CONFIG_PATH \
              LIBRARY_PATH=$(PREFIX)/lib:$$LIBRARY_PATH \
              DYLD_FALLBACK_LIBRARY_PATH=$(PREFIX)/lib:$$DYLD_FALLBACK_LIBRARY_PATH
 
-ENTITLEMENTS := nixvm-entitlements.plist
+ENTITLEMENTS := entitlements.plist
 
 .PHONY: all debug libkrun clean distclean
 

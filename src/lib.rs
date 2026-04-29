@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
 mod nix_sys {
@@ -33,23 +33,57 @@ mod sys {
 const NIXVM_EDK2_PATH: &str = env!("NIXVM_EDK2_PATH");
 
 #[derive(Debug, Clone)]
-pub struct Args {
+pub struct RunArgs {
     pub flake_ref: String,
+    /// If `Some`, copy the image to this path and keep it across exit.
+    /// Resume later with `nixvm load <path>`.
+    pub persist: Option<PathBuf>,
     pub cpus: u8,
     pub memory_mib: u32,
 }
 
-pub fn run(args: Args) -> Result<u8> {
-    let (flake_uri, attr_path) = split_flake_ref(&args.flake_ref)?;
+#[derive(Debug, Clone)]
+pub struct LoadArgs {
+    /// Existing image to boot in place. Writes are persisted back to it.
+    pub path: PathBuf,
+    pub cpus: u8,
+    pub memory_mib: u32,
+}
 
+/// Build a flake's image and boot it. Ephemeral overlay unless `persist` is set.
+pub fn run(args: RunArgs) -> Result<u8> {
+    let id = uuid::Uuid::now_v7();
+    info!(%id, "starting");
+
+    let (flake_uri, attr_path) = split_flake_ref(&args.flake_ref)?;
     let flake_uri = canonicalize_flake_uri(&flake_uri)?;
     debug!(flake = %flake_uri, attr = %attr_path, "evaluating + realising flake output");
     let image_path = nix_realise_image(&flake_uri, &attr_path)
         .context("failed to evaluate or realise the flake output")?;
     debug!(image = %image_path.display(), "built image");
 
-    // Copy the immutable built image to an ephemeral per-launch overlay.
-    let overlay = Overlay::from_base(&image_path).context("failed to prepare overlay")?;
+    let overlay = match args.persist {
+        Some(path) => Overlay::persistent(&image_path, path),
+        None => Overlay::ephemeral(&image_path, id),
+    }
+    .context("failed to prepare overlay")?;
+
+    launch_vm(overlay, id, args.cpus, args.memory_mib)
+}
+
+/// Boot a previously-saved image (from `nixvm run -p`) in place. Writes
+/// during the run mutate the file; resume by running `load` again.
+pub fn load(args: LoadArgs) -> Result<u8> {
+    let id = uuid::Uuid::now_v7();
+    info!(%id, "starting");
+
+    let overlay = Overlay::load(args.path).context("failed to open image")?;
+    launch_vm(overlay, id, args.cpus, args.memory_mib)
+}
+
+/// Shared launch path: vmnet, raw TTY, fork, libkrun, wait, cleanup.
+fn launch_vm(overlay: Overlay, id: uuid::Uuid, cpus: u8, mem_mib: u32) -> Result<u8> {
+    let _span = tracing::info_span!("vm", %id).entered();
 
     // Open vmnet *before* fork. The interface_ref + dispatch queue are
     // valid only in the process that created them, so the parent owns
@@ -64,10 +98,11 @@ pub fn run(args: Args) -> Result<u8> {
     // Saving + restoring with a Drop guard cleans up on any exit path.
     let _tty = RawTerminal::enter();
 
-    let exit_code = fork_and_run_vm(&overlay, &vmnet, args.cpus, args.memory_mib)
+    let exit_code = fork_and_run_vm(&overlay, &vmnet, cpus, mem_mib)
         .context("failed to launch the VM")?;
     // vmnet drops here, AFTER waitpid → pump thread joins, vmnet_stop_interface fires.
     drop(vmnet);
+    drop(overlay);
     Ok(exit_code)
 }
 
@@ -328,37 +363,73 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 
 struct Overlay {
     path: PathBuf,
+    mode: OverlayMode,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum OverlayMode {
+    /// Per-launch tempfile in `$TMPDIR`, deleted on Drop.
+    Ephemeral,
+    /// Created at user-specified path by `run -p`, retained on Drop.
+    Persistent,
+    /// Existing file opened by `load`, retained on Drop.
+    Loaded,
 }
 
 impl Overlay {
-    fn from_base(base: &Path) -> Result<Self> {
-        // tempfile::Builder gives us a uniquely-named file we own; we delete
-        // it on Drop.
-        let tmp = tempfile::Builder::new()
-            .prefix("nixvm-overlay-")
-            .suffix(".img")
-            .tempfile()
-            .context("create tempfile for overlay")?;
-        let path = tmp.path().to_owned();
-        // Close the FD so std::fs::copy can write freely on macOS.
-        drop(tmp.into_temp_path().keep().context("retain overlay path")?);
-        fs::copy(base, &path).with_context(|| {
-            format!("copy {} → {}", base.display(), path.display())
-        })?;
-        // fs::copy preserves the source's permissions; the source is in
-        // /nix/store and read-only. libkrun opens disk images read-write,
-        // which fails on a 0444 file.
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&path, perms)?;
-        Ok(Self { path })
+    /// `nixvm run` (default): copy base to `$TMPDIR/nixvm-<uuid>.img`.
+    fn ephemeral(base: &Path, id: uuid::Uuid) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("nixvm-{id}.img"));
+        copy_writable(base, &path)?;
+        Ok(Self { path, mode: OverlayMode::Ephemeral })
+    }
+
+    /// `nixvm run -p PATH`: copy base to PATH, retain on exit.
+    fn persistent(base: &Path, dest: PathBuf) -> Result<Self> {
+        if dest.exists() {
+            bail!(
+                "{} already exists; pass `nixvm load {}` to resume it",
+                dest.display(),
+                dest.display(),
+            );
+        }
+        copy_writable(base, &dest)?;
+        Ok(Self { path: dest, mode: OverlayMode::Persistent })
+    }
+
+    /// `nixvm load PATH`: open PATH in place. Writes mutate it.
+    fn load(path: PathBuf) -> Result<Self> {
+        if !path.exists() {
+            bail!("{} does not exist", path.display());
+        }
+        let perm_mode = fs::metadata(&path)?.permissions().mode();
+        if perm_mode & 0o200 == 0 {
+            bail!(
+                "{} is not writable; chmod u+w it or copy it elsewhere first",
+                path.display(),
+            );
+        }
+        Ok(Self { path, mode: OverlayMode::Loaded })
     }
 }
 
 impl Drop for Overlay {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if matches!(self.mode, OverlayMode::Ephemeral) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Copy a (potentially read-only, e.g. /nix/store) base image to `dest`,
+/// then chmod the destination 0600 so libkrun can open it read-write.
+fn copy_writable(base: &Path, dest: &Path) -> Result<()> {
+    fs::copy(base, dest)
+        .with_context(|| format!("copy {} → {}", base.display(), dest.display()))?;
+    let mut perms = fs::metadata(dest)?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(dest, perms)?;
+    Ok(())
 }
 
 // ──────────────────────────── raw terminal ────────────────────────────
@@ -785,7 +856,7 @@ fn fork_and_run_vm(overlay: &Overlay, vmnet: &Vmnet, cpus: u8, mem_mib: u32) -> 
         Ok(libc::WEXITSTATUS(status) as u8)
     } else if libc::WIFSIGNALED(status) {
         let sig = libc::WTERMSIG(status);
-        eprintln!("nixvm: VM terminated by signal {sig}");
+        warn!(signal = sig, "VM terminated by signal");
         Ok(128 + sig as u8)
     } else {
         bail!("VM exited with unknown status {status}")

@@ -113,7 +113,7 @@ bootloader install step.
 ├── Makefile                   # libkrun build + cargo build orchestration
 ├── build.rs                   # libkrun pkg-config + Nix C API + vmnet bindings
 ├── Cargo.toml
-├── nixvm-entitlements.plist   # codesign entitlements (hypervisor + virtualization)
+├── entitlements.plist         # codesign entitlements (hypervisor + virtualization)
 ├── src/
 │   ├── main.rs                # clap CLI
 │   └── lib.rs                 # Nix eval/realise + libkrun + vmnet pump + fork
@@ -136,5 +136,5 @@ bootloader install step.
   `com.apple.security.hypervisor` (libkrun) and
   `com.apple.security.virtualization` (vmnet on macOS 26). The Makefile
   does this automatically; if you `cargo build` directly, run
-  `codesign --force --sign - --entitlements nixvm-entitlements.plist target/release/nixvm`
+  `codesign --force --sign - --entitlements entitlements.plist target/release/nixvm`
   yourself afterward.
