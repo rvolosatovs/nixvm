@@ -56,6 +56,13 @@ disk image bootable under libkrun. Concretely, the image must satisfy:
 `examples/test-vm/module.nix` is a reference NixOS module satisfying all of
 these — copy it or import it into your own flake.
 
+`examples/nixelium/` shows how to bolt the contract onto an *existing*
+NixOS configuration: it imports
+[`nixelium`](https://github.com/rvolosatovs/nixelium)'s baseline
+`nixosModules.default` and overrides only what libkrun requires
+(lanzaboote off, `console=hvc0`, virtio modules, virtiofs `/nix/store`,
+UKI at the EFI fallback path).
+
 ## Build
 
 You need a working Nix install (with the C API — Nix ≥ 2.30) and **macOS 26+**
@@ -117,7 +124,8 @@ bootloader install step.
 ├── src/
 │   ├── main.rs                # clap CLI
 │   └── lib.rs                 # Nix eval/realise + libkrun + vmnet pump + fork
-├── examples/test-vm/          # reference NixOS image fitting the contract
+├── examples/test-vm/          # minimal reference NixOS image fitting the contract
+├── examples/nixelium/         # imports the nixelium flake and adapts it to the contract
 └── vendor/libkrun/            # git submodule (containers/libkrun, pinned)
 ```
 

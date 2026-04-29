@@ -47,6 +47,10 @@ $(LIBKRUN_PC):
 
 clean:
 	cargo clean
+	# libkrun's krun-vmm build.rs bakes CARGO_MANIFEST_DIR into a
+	# rustc-env, and cargo caches build-script output. Without this,
+	# moving the repo leaves a stale absolute path in the cached output.
+	$(MAKE) -C $(LIBKRUN) clean || true
 	rm -rf build
 
 distclean: clean
