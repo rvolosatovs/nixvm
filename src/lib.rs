@@ -46,6 +46,10 @@ pub struct RunArgs {
     /// `(key, uri)` pairs from `--override-input KEY URI`, applied during
     /// flake locking. Mirrors `nix build --override-input`.
     pub overrides: Vec<(String, String)>,
+    /// `(name, value)` pairs from `--option NAME VALUE`, applied via
+    /// `nix_setting_set` before libstore/libexpr init. Mirrors
+    /// `nix --option`.
+    pub settings: Vec<(String, String)>,
     /// If `Some`, copy the image to this path and keep it across exit.
     /// Resume later with `nixvm load <path>`.
     pub persist: Option<PathBuf>,
@@ -83,7 +87,7 @@ pub fn run(args: RunArgs) -> Result<u8> {
     info!(%id, "starting");
 
     debug!(flake = %args.flake_ref, "evaluating + realising flake output");
-    let realised = nix_realise_image(&args.flake_ref, &args.overrides)
+    let realised = nix_realise_image(&args.flake_ref, &args.overrides, &args.settings)
         .context("failed to evaluate or realise the flake output")?;
     debug!(
         image = %realised.image_file.display(),
@@ -421,7 +425,11 @@ fn read_string(
 /// $PWD as base directory (so `./foo` resolves like `nix build`), apply
 /// any `--override-input` entries during virtual locking, then walk the
 /// resulting outputs tree to extract drvPath/outPath/fileName.
-fn nix_realise_image(flake_uri: &str, overrides: &[(String, String)]) -> Result<Realised> {
+fn nix_realise_image(
+    flake_uri: &str,
+    overrides: &[(String, String)],
+    settings: &[(String, String)],
+) -> Result<Realised> {
     let ctx = NixCtx::new()?;
 
     unsafe {
@@ -433,6 +441,20 @@ fn nix_realise_image(flake_uri: &str, overrides: &[(String, String)]) -> Result<
         let val = CString::new("nix-command flakes").unwrap();
         nix_sys::nix_setting_set(ctx.raw, key.as_ptr(), val.as_ptr());
         ctx.check().context("enable experimental flakes feature")?;
+
+        // User-supplied `--option NAME VALUE`. Applied here, before
+        // libstore/libexpr init, so settings like `tarball-ttl`,
+        // `substitute`, `connect-timeout` reach the same code path
+        // `nix --option NAME VALUE` uses.
+        for (name, value) in settings {
+            let key = CString::new(name.as_str())
+                .with_context(|| format!("--option name `{name}` contains a NUL byte"))?;
+            let val = CString::new(value.as_str())
+                .with_context(|| format!("--option value for `{name}` contains a NUL byte"))?;
+            nix_sys::nix_setting_set(ctx.raw, key.as_ptr(), val.as_ptr());
+            ctx.check()
+                .with_context(|| format!("set nix option `{name} = {value}`"))?;
+        }
 
         nix_sys::nix_libstore_init(ctx.raw);
         ctx.check().context("nix_libstore_init")?;

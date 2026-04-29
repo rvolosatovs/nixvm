@@ -37,6 +37,17 @@ enum Command {
         )]
         override_input: Vec<String>,
 
+        /// Set a Nix configuration option. Repeatable. Same syntax as
+        /// `nix --option NAME VALUE` (e.g. `--option tarball-ttl 0`,
+        /// `--option substitute false`, `--option connect-timeout 5`).
+        #[arg(
+            long = "option",
+            value_names = ["NAME", "VALUE"],
+            num_args = 2,
+            action = clap::ArgAction::Append,
+        )]
+        option: Vec<String>,
+
         /// Save the image to PATH instead of an ephemeral tempfile.
         /// Resume later with `nixvm load PATH`.
         #[arg(short = 'p', long = "persist", value_name = "PATH")]
@@ -80,18 +91,25 @@ fn main() -> ExitCode {
         Command::Run {
             flake_ref,
             override_input,
+            option,
             persist,
             cpus,
             memory_mib,
-        } => parse_overrides(override_input).and_then(|overrides| {
-            nixvm::run(nixvm::RunArgs {
-                flake_ref,
-                overrides,
-                persist,
-                cpus,
-                memory_mib,
+        } => parse_pairs("--override-input", override_input)
+            .and_then(|overrides| {
+                let settings = parse_pairs("--option", option)?;
+                Ok((overrides, settings))
             })
-        }),
+            .and_then(|(overrides, settings)| {
+                nixvm::run(nixvm::RunArgs {
+                    flake_ref,
+                    overrides,
+                    settings,
+                    persist,
+                    cpus,
+                    memory_mib,
+                })
+            }),
         Command::Load {
             path,
             cpus,
@@ -112,13 +130,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// Pair up the flat `--override-input KEY URI` Vec produced by clap
-/// (`num_args = 2, action = Append`) into `(key, uri)` tuples.
-fn parse_overrides(raw: Vec<String>) -> Result<Vec<(String, String)>> {
+/// Pair up the flat `num_args = 2, action = Append` Vec clap produces for
+/// repeatable two-argument flags (`--override-input KEY URI`,
+/// `--option NAME VALUE`) into `(key, value)` tuples.
+fn parse_pairs(flag: &str, raw: Vec<String>) -> Result<Vec<(String, String)>> {
     if raw.len() % 2 != 0 {
-        return Err(anyhow!(
-            "--override-input requires `KEY URI` (got odd argument count)"
-        ));
+        return Err(anyhow!("{flag} requires two arguments per use"));
     }
     Ok(raw
         .chunks_exact(2)
