@@ -6,13 +6,15 @@
   description = "nixvm image built from nixelium's nixosModules.default";
 
   inputs.nixelium.url = "github:rvolosatovs/nixelium";
+  inputs.nixvm.url = "git+file:../..";
 
   outputs =
-    { nixelium, ... }:
+    { nixelium, nixvm, ... }:
     {
       nixosConfigurations.default = nixelium.inputs.nixpkgs-nixos.lib.nixosSystem {
         system = "aarch64-linux";
         modules = [
+          nixvm.nixosModules.guest
           nixelium.nixosModules.default
           ./module.nix
         ];

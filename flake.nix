@@ -1,7 +1,8 @@
-# Dev environment for nixvm. `nix develop` then `make`.
+# Dev environment for nixvm + the shared NixOS guest module.
 #
-# Intentionally only exposes a devShell — packaging nixvm itself is out of
-# scope for the PoC. This flake only sets up the build environment.
+# Packaging nixvm itself is out of scope for the PoC, so this flake exposes:
+#   - devShells.aarch64-darwin.default — `nix develop` then `make`
+#   - nixosModules.guest               — host↔guest contract for image flakes
 {
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -12,6 +13,9 @@
       pkgs = nixpkgs.legacyPackages.${system};
     in
     {
+      nixosModules.guest = ./modules/guest.nix;
+      nixosModules.default = self.nixosModules.guest;
+
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs; [
           # Cargo build pipeline
