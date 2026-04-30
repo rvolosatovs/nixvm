@@ -1,47 +1,44 @@
 # Dev environment for nixvm + the shared NixOS guest module.
 #
-# Packaging nixvm itself is out of scope for the PoC, so this flake exposes:
+# Packaging nixvm itself is out of scope for the PoC (libkrun submodule build +
+# codesigning don't fit nixify's Rust flow), so this flake exposes:
 #   - devShells.aarch64-darwin.default — `nix develop` then `make`
 #   - nixosModules.guest               — host↔guest contract for image flakes
 {
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nixify.url = "github:rvolosatovs/nixify";
 
   outputs =
-    { self, nixpkgs }:
-    let
-      system = "aarch64-darwin";
-      pkgs = nixpkgs.legacyPackages.${system};
-    in
-    {
+    { self, nixify, ... }:
+    with nixify.lib;
+    rust.mkFlake {
+      src = self;
+
+      # Packaging is out of scope — drop the auto-generated rust packages,
+      # checks and apps so the flake only exposes the devShell.
+      withPackages = _: { };
+      withChecks = _: { };
+      withApps = _: { };
+
+      withDevShells =
+        { pkgs, devShells, ... }:
+        extendDerivations {
+          nativeBuildInputs = with pkgs; [
+            gnumake
+            lld
+            llvmPackages.libclang.lib
+            pkg-config
+            xz
+          ];
+
+          buildInputs = with pkgs; [
+            nix
+          ];
+
+          env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        } devShells;
+    }
+    // {
       nixosModules.guest = ./modules/guest.nix;
-      nixosModules.default = self.nixosModules.guest;
-
-      devShells.${system}.default = pkgs.mkShell {
-        nativeBuildInputs = with pkgs; [
-          # Cargo build pipeline
-          pkg-config
-          rustc
-          cargo
-          rustfmt
-          clippy
-          rust-analyzer
-
-          # bindgen needs libclang at runtime
-          llvmPackages.libclang.lib
-
-          # libkrun submodule build
-          gnumake
-          lld
-          xz
-        ];
-
-        buildInputs = with pkgs; [
-          # Nix C API libs (.pc files + headers via dev outputs)
-          nix
-        ];
-
-        # bindgen finds libclang via this env var
-        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-      };
+      nixosModules.default = ./modules/guest.nix;
     };
 }
