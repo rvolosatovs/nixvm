@@ -74,6 +74,8 @@ pub struct RunArgs {
     /// If `Some`, copy the image to this path and keep it across exit.
     /// Resume later with `nixvm load <path>`.
     pub persist: Option<PathBuf>,
+    /// Overwrite `persist` if it already exists. Mirrors `--force`/`-f`.
+    pub force: bool,
     pub cpus: u8,
     pub memory_mib: u32,
 }
@@ -126,7 +128,7 @@ pub fn run(args: RunArgs) -> Result<u8> {
         .context("derive kernel/initrd/cmdline from realised toplevel")?;
 
     let overlay = match args.persist {
-        Some(path) => Overlay::persistent(&realised.image_file, path),
+        Some(path) => Overlay::persistent(&realised.image_file, path, args.force),
         None => Overlay::ephemeral(&realised.image_file, id),
     }
     .context("failed to prepare overlay")?;
@@ -904,14 +906,21 @@ impl Overlay {
         })
     }
 
-    /// `nixvm run -p PATH`: copy base to PATH, retain on exit.
-    fn persistent(base: &Path, dest: PathBuf) -> Result<Self> {
+    /// `nixvm run -p PATH`: copy base to PATH, retain on exit. With
+    /// `force`, an existing file at PATH is unlinked first (along with
+    /// its sidecar) so the new image replaces it cleanly.
+    fn persistent(base: &Path, dest: PathBuf, force: bool) -> Result<Self> {
         if dest.exists() {
-            bail!(
-                "{} already exists; pass `nixvm load {}` to resume it",
-                dest.display(),
-                dest.display(),
-            );
+            if !force {
+                bail!(
+                    "{} already exists; pass `nixvm load {}` to resume it, or `--force` to overwrite",
+                    dest.display(),
+                    dest.display(),
+                );
+            }
+            fs::remove_file(&dest)
+                .with_context(|| format!("remove existing {}", dest.display()))?;
+            let _ = fs::remove_file(sidecar_path(&dest));
         }
         copy_writable(base, &dest)?;
         Ok(Self {

@@ -62,6 +62,10 @@ enum Command {
         #[arg(short = 'p', long = "persist", value_name = "PATH")]
         persist: Option<PathBuf>,
 
+        /// Overwrite the `--persist` path if it already exists.
+        #[arg(short = 'f', long = "force", requires = "persist")]
+        force: bool,
+
         /// Number of vCPUs to allocate to the guest.
         #[arg(long, default_value_t = 2)]
         cpus: u8,
@@ -103,6 +107,7 @@ fn main() -> ExitCode {
             option,
             tarball_ttl,
             persist,
+            force,
             cpus,
             memory_mib,
         } => parse_pairs("--override-input", override_input)
@@ -117,6 +122,7 @@ fn main() -> ExitCode {
                     settings,
                     tarball_ttl,
                     persist,
+                    force,
                     cpus,
                     memory_mib,
                 })
