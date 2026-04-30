@@ -40,8 +40,14 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/sys_bindings.rs"));
 }
 
-// Per-instance fetcher-settings setter. See `c_src/nix_setting_shim.cc`.
+// Per-instance fetcher-settings constructor + setter. See
+// `c_src/nix_setting_shim.cc` — `nix_fetchers_settings_new` upstream
+// is move-from-temporary unsafe and `nix_setting_set` doesn't reach
+// fetcher options.
 unsafe extern "C" {
+    fn nixvm_fetchers_settings_new(
+        ctx: *mut nix_sys::nix_c_context,
+    ) -> *mut nix_sys::nix_fetchers_settings;
     fn nixvm_fetchers_settings_set(
         ctx: *mut nix_sys::nix_c_context,
         settings: *mut nix_sys::nix_fetchers_settings,
@@ -512,10 +518,14 @@ fn nix_realise_image(
     let _flake_settings_guard =
         scopeguard(|| unsafe { nix_sys::nix_flake_settings_free(flake_settings) });
 
-    let fetch_settings = unsafe { nix_sys::nix_fetchers_settings_new(ctx.raw) };
-    ctx.check().context("nix_fetchers_settings_new")?;
+    // `nixvm_fetchers_settings_new`, not `nix_fetchers_settings_new`:
+    // upstream's version returns a `Settings` whose `_settings` map is
+    // populated with dangling pointers (move-from-temporary), and
+    // `Config::set` segfaults on first use. See `c_src/nix_setting_shim.cc`.
+    let fetch_settings = unsafe { nixvm_fetchers_settings_new(ctx.raw) };
+    ctx.check().context("nixvm_fetchers_settings_new")?;
     if fetch_settings.is_null() {
-        bail!("nix_fetchers_settings_new returned NULL");
+        bail!("nixvm_fetchers_settings_new returned NULL");
     }
     let _fetch_settings_guard =
         scopeguard(|| unsafe { nix_sys::nix_fetchers_settings_free(fetch_settings) });
