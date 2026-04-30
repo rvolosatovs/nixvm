@@ -45,111 +45,111 @@ in
   };
 
   config = {
-  # ---- Boot ---------------------------------------------------------------
-  # No bootloader and no UKI: nixvm boots the kernel directly with
-  # krun_set_kernel, supplying its own cmdline.
-  boot.loader.grub.enable = lib.mkDefault false;
-  boot.loader.systemd-boot.enable = lib.mkDefault false;
-  boot.loader.efi.canTouchEfiVariables = lib.mkDefault false;
+    # ---- Boot ---------------------------------------------------------------
+    # No bootloader and no UKI: nixvm boots the kernel directly with
+    # krun_set_kernel, supplying its own cmdline.
+    boot.loader.grub.enable = lib.mkDefault false;
+    boot.loader.systemd-boot.enable = lib.mkDefault false;
+    boot.loader.efi.canTouchEfiVariables = lib.mkDefault false;
 
-  # libkrun's implicit virtio-console is auto-wired to the host's fd 0/1/2.
-  boot.kernelParams = [ "console=hvc0" ];
+    # libkrun's implicit virtio-console is auto-wired to the host's fd 0/1/2.
+    boot.kernelParams = [ "console=hvc0" ];
 
-  boot.initrd.availableKernelModules = [
-    "virtio_pci"
-    "virtio_blk"
-    "virtio_console"
-    "virtio_net"
-    "virtiofs"
-    "overlay"
-  ];
+    boot.initrd.availableKernelModules = [
+      "virtio_pci"
+      "virtio_blk"
+      "virtio_console"
+      "virtio_net"
+      "virtiofs"
+      "overlay"
+    ];
 
-  # NixOS's default re-binds /nix/store with `ro` after stage-2, which
-  # would stack a read-only overlay on top of the writable initrd overlay
-  # below and break every guest write (home-manager activation, nix-env,
-  # GC roots) with EROFS. Drop the `ro` so the underlying overlay's
-  # writes actually land.
-  boot.nixStoreMountOpts = lib.mkDefault [ ];
+    # NixOS's default re-binds /nix/store with `ro` after stage-2, which
+    # would stack a read-only overlay on top of the writable initrd overlay
+    # below and break every guest write (home-manager activation, nix-env,
+    # GC roots) with EROFS. Drop the `ro` so the underlying overlay's
+    # writes actually land.
+    boot.nixStoreMountOpts = lib.mkDefault [ ];
 
-  # ---- /nix/store registration --------------------------------------------
-  # /nix/store is virtiofs-shared from the host, so the closure's paths
-  # physically exist under the overlay's lower layer — but the guest's
-  # Nix database (on the root partition) starts empty. Without registration,
-  # `nix-store --realise` against a closure-resident path (home-manager's
-  # GC root creation, `nix run`, etc.) falls through to substituters and
-  # fails ("no substituter that can build it").
-  #
-  # We mirror nixos/modules/virtualisation/qemu-vm.nix: nixvm passes
-  # `regInfo=<path>` on the kernel cmdline, where the path points at a
-  # `pkgs.closureInfo` registration file (also in the host's /nix/store
-  # and reachable via the same virtiofs share). The closure_info derivation
-  # is exposed as `system.build.closureInfo` so nixvm can evaluate its
-  # outPath without re-doing the closure walk itself.
-  system.build.closureInfo = closureInfo;
+    # ---- /nix/store registration --------------------------------------------
+    # /nix/store is virtiofs-shared from the host, so the closure's paths
+    # physically exist under the overlay's lower layer — but the guest's
+    # Nix database (on the root partition) starts empty. Without registration,
+    # `nix-store --realise` against a closure-resident path (home-manager's
+    # GC root creation, `nix run`, etc.) falls through to substituters and
+    # fails ("no substituter that can build it").
+    #
+    # We mirror nixos/modules/virtualisation/qemu-vm.nix: nixvm passes
+    # `regInfo=<path>` on the kernel cmdline, where the path points at a
+    # `pkgs.closureInfo` registration file (also in the host's /nix/store
+    # and reachable via the same virtiofs share). The closure_info derivation
+    # is exposed as `system.build.closureInfo` so nixvm can evaluate its
+    # outPath without re-doing the closure walk itself.
+    system.build.closureInfo = closureInfo;
 
-  boot.postBootCommands = ''
-    if [[ "$(cat /proc/cmdline)" =~ regInfo=([^[:space:]]+) ]]; then
-      ${config.nix.package.out}/bin/nix-store --load-db < "''${BASH_REMATCH[1]}"
-    fi
-  '';
+    boot.postBootCommands = ''
+      if [[ "$(cat /proc/cmdline)" =~ regInfo=([^[:space:]]+) ]]; then
+        ${config.nix.package.out}/bin/nix-store --load-db < "''${BASH_REMATCH[1]}"
+      fi
+    '';
 
-  # ---- Filesystems --------------------------------------------------------
-  fileSystems."/".device = "/dev/disk/by-partlabel/nixos";
-  fileSystems."/".fsType = "ext4";
+    # ---- Filesystems --------------------------------------------------------
+    fileSystems."/".device = "/dev/disk/by-partlabel/nixos";
+    fileSystems."/".fsType = "ext4";
 
-  # /nix/store is an overlay so guest writes succeed without escaping back
-  # to the host. Lower is virtiofs from the host (ro), upper/work are on a
-  # tmpfs — writes are ephemeral and re-created on each boot.
-  fileSystems."/nix/.ro-store".device = "nixstore";
-  fileSystems."/nix/.ro-store".fsType = "virtiofs";
-  fileSystems."/nix/.ro-store".options = [
-    "ro"
-    "nofail"
-  ];
-  fileSystems."/nix/.ro-store".neededForBoot = true;
+    # /nix/store is an overlay so guest writes succeed without escaping back
+    # to the host. Lower is virtiofs from the host (ro), upper/work are on a
+    # tmpfs — writes are ephemeral and re-created on each boot.
+    fileSystems."/nix/.ro-store".device = "nixstore";
+    fileSystems."/nix/.ro-store".fsType = "virtiofs";
+    fileSystems."/nix/.ro-store".options = [
+      "ro"
+      "nofail"
+    ];
+    fileSystems."/nix/.ro-store".neededForBoot = true;
 
-  fileSystems."/nix/.rw-store".fsType = "tmpfs";
-  fileSystems."/nix/.rw-store".options = [ "mode=0755" ];
-  fileSystems."/nix/.rw-store".neededForBoot = true;
+    fileSystems."/nix/.rw-store".fsType = "tmpfs";
+    fileSystems."/nix/.rw-store".options = [ "mode=0755" ];
+    fileSystems."/nix/.rw-store".neededForBoot = true;
 
-  fileSystems."/nix/store".overlay.lowerdir = [ "/nix/.ro-store" ];
-  fileSystems."/nix/store".overlay.upperdir = "/nix/.rw-store/upper";
-  fileSystems."/nix/store".overlay.workdir = "/nix/.rw-store/work";
-  fileSystems."/nix/store".neededForBoot = true;
+    fileSystems."/nix/store".overlay.lowerdir = [ "/nix/.ro-store" ];
+    fileSystems."/nix/store".overlay.upperdir = "/nix/.rw-store/upper";
+    fileSystems."/nix/store".overlay.workdir = "/nix/.rw-store/work";
+    fileSystems."/nix/store".neededForBoot = true;
 
-  # ---- Login --------------------------------------------------------------
-  services.getty.autologinUser = lib.mkDefault "root";
-  services.getty.extraArgs = [
-    "--keep-baud"
-    "--noclear"
-  ];
-  # agetty's environment is what the login shell inherits — set TERM here
-  # so readline/bash use modern escape sequences matching most host
-  # terminals (kitty, iTerm, Terminal.app).
-  systemd.services."getty@hvc0".environment.TERM = "xterm-256color";
-  users.users.root.initialHashedPassword = lib.mkDefault "";
+    # ---- Login --------------------------------------------------------------
+    services.getty.autologinUser = lib.mkDefault "root";
+    services.getty.extraArgs = [
+      "--keep-baud"
+      "--noclear"
+    ];
+    # agetty's environment is what the login shell inherits — set TERM here
+    # so readline/bash use modern escape sequences matching most host
+    # terminals (kitty, iTerm, Terminal.app).
+    systemd.services."getty@hvc0".environment.TERM = "xterm-256color";
+    users.users.root.initialHashedPassword = lib.mkDefault "";
 
-  # ---- Networking ---------------------------------------------------------
-  # nixvm wires virtio-net to vmnet (Apple's framework). Vmnet shared mode
-  # runs a built-in DHCP server, so just enable the client.
-  networking.useDHCP = lib.mkDefault true;
-  networking.firewall.enable = lib.mkDefault false;
+    # ---- Networking ---------------------------------------------------------
+    # nixvm wires virtio-net to vmnet (Apple's framework). Vmnet shared mode
+    # runs a built-in DHCP server, so just enable the client.
+    networking.useDHCP = lib.mkDefault true;
+    networking.firewall.enable = lib.mkDefault false;
 
-  # ---- Image build (systemd-repart, no runInLinuxVM) ---------------------
-  # Single ext4 root partition — no ESP, no UKI: nixvm passes kernel +
-  # initrd to libkrun directly from the host's /nix/store.
-  image.repart.name = lib.mkDefault config.system.image.id;
+    # ---- Image build (systemd-repart, no runInLinuxVM) ---------------------
+    # Single ext4 root partition — no ESP, no UKI: nixvm passes kernel +
+    # initrd to libkrun directly from the host's /nix/store.
+    image.repart.name = lib.mkDefault config.system.image.id;
 
-  image.repart.partitions."10-root".repartConfig.Type = "root";
-  image.repart.partitions."10-root".repartConfig.Format = "ext4";
-  image.repart.partitions."10-root".repartConfig.Label = "nixos";
-  # Headroom for /var (notably /var/nix/db.sqlite once the closure is
-  # registered) plus /etc, /home, /tmp runtime state. 256M keeps the whole
-  # default image inside the determinate-nixd builder's tmpfs.
-  image.repart.partitions."10-root".repartConfig.SizeMinBytes = lib.mkDefault cfg.rootSize;
-  image.repart.partitions."10-root".repartConfig.SizeMaxBytes = lib.mkDefault cfg.rootSize;
+    image.repart.partitions."10-root".repartConfig.Type = "root";
+    image.repart.partitions."10-root".repartConfig.Format = "ext4";
+    image.repart.partitions."10-root".repartConfig.Label = "nixos";
+    # Headroom for /var (notably /var/nix/db.sqlite once the closure is
+    # registered) plus /etc, /home, /tmp runtime state. 256M keeps the whole
+    # default image inside the determinate-nixd builder's tmpfs.
+    image.repart.partitions."10-root".repartConfig.SizeMinBytes = lib.mkDefault cfg.rootSize;
+    image.repart.partitions."10-root".repartConfig.SizeMaxBytes = lib.mkDefault cfg.rootSize;
 
-  documentation.enable = lib.mkDefault false;
-  documentation.man.enable = lib.mkDefault false;
+    documentation.enable = lib.mkDefault false;
+    documentation.man.enable = lib.mkDefault false;
   };
 }
