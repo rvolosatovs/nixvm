@@ -140,6 +140,11 @@ in
     # instance — otherwise agetty falls through to its hardcoded default
     # for non-`tty*` lines (vt220 in current util-linux).
     systemd.services."serial-getty@hvc0".environment.TERM = "xterm-256color";
+    # The default ncurses terminfo set is minimal (linux, vt100, dumb, …)
+    # and lacks xterm-256color, so /etc/set-environment's `tput`-style
+    # lookup warns at every shell start. Pull in the full set so any TERM
+    # the host might propagate (kitty, wezterm, ghostty, …) resolves.
+    environment.enableAllTerminfo = lib.mkDefault true;
     users.users.root.initialHashedPassword = lib.mkDefault "";
 
     # ---- Networking ---------------------------------------------------------
