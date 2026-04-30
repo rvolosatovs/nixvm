@@ -93,6 +93,15 @@ in
       fi
     '';
 
+    # Automatic GC is fundamentally incompatible with the /nix/store overlay:
+    # the rw upper is a tmpfs wiped on every boot, so periodic GC has nothing
+    # durable to clean, and any path eligible for deletion that lives on the
+    # virtiofs (ro) lower fails with ENETDOWN ("Network dropped connection")
+    # when nix tries to chmod it for unlink. Leave it off by default; users
+    # can still run `nix-collect-garbage` manually if they understand the
+    # caveats.
+    nix.gc.automatic = lib.mkDefault false;
+
     # ---- Filesystems --------------------------------------------------------
     fileSystems."/".device = "/dev/disk/by-partlabel/nixos";
     fileSystems."/".fsType = "ext4";
