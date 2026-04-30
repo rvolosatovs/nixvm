@@ -68,6 +68,11 @@ pub struct RunArgs {
     pub persist: Option<PathBuf>,
     /// Overwrite `persist` if it already exists. Mirrors `--force`/`-f`.
     pub force: bool,
+    /// If true, double-fork after setup and run the VM in a detached daemon
+    /// owned by launchd. Stdout/stderr go to a per-launch log file under
+    /// `$XDG_STATE_HOME/nixvm/logs/`; the original `nixvm` process exits 0
+    /// immediately so the user's shell prompt returns.
+    pub detach: bool,
     pub cpus: u8,
     pub memory_mib: u32,
 }
@@ -76,6 +81,7 @@ pub struct RunArgs {
 pub struct LoadArgs {
     /// Existing image to boot in place. Writes are persisted back to it.
     pub path: PathBuf,
+    pub detach: bool,
     pub cpus: u8,
     pub memory_mib: u32,
 }
@@ -142,6 +148,10 @@ pub fn run(args: RunArgs) -> Result<u8> {
         OverlayMode::Loaded => unreachable!("run does not produce Loaded overlays"),
     };
 
+    if args.detach {
+        detach_into_daemon(id).context("detach into daemon")?;
+    }
+
     let result = launch_vm(overlay, &boot, id, args.cpus, args.memory_mib);
     drop(gc_root);
     result
@@ -174,6 +184,10 @@ pub fn load(args: LoadArgs) -> Result<u8> {
         .context("derive kernel/initrd/cmdline from sidecar toplevel")?;
     let gc_root =
         GcRoot::persistent(&closure_info, &overlay.path).context("refresh persistent GC root")?;
+
+    if args.detach {
+        detach_into_daemon(id).context("detach into daemon")?;
+    }
 
     let result = launch_vm(overlay, &boot, id, args.cpus, args.memory_mib);
     drop(gc_root);
@@ -285,14 +299,108 @@ fn read_sidecar(image: &Path) -> Result<(PathBuf, PathBuf)> {
     ))
 }
 
-fn xdg_state_home() -> PathBuf {
-    if let Ok(v) = std::env::var("XDG_STATE_HOME") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
+/// Root directory for nixvm's per-user state (GC root indirections,
+/// `--detach` logs, etc.). On macOS this resolves via
+/// `dirs::data_local_dir()` to `~/Library/Application Support/nixvm` — the
+/// native convention. Falls back to `$TMPDIR` only if neither `$HOME` nor
+/// the platform-specific data dir is available; in practice that branch
+/// never trips on a normally-configured macOS account.
+fn state_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("nixvm")
+}
+
+/// Per-launch log file used by `--detach`. One file per launch keyed off
+/// the same UUID we already generate for ephemeral GC roots, so a host can
+/// have many detached VMs running with non-colliding logs.
+fn log_path_for(id: uuid::Uuid) -> PathBuf {
+    state_dir().join("logs").join(format!("{id}.log"))
+}
+
+/// Classic double-fork daemonize. After this returns in the surviving
+/// process: no controlling TTY, parent is launchd, stdin is `/dev/null`,
+/// stdout/stderr point at the per-launch log file.
+///
+/// We reach this point with overlay + GC root already constructed in the
+/// foreground (so user-visible errors stay user-visible). Their `Drop`
+/// impls live on the stack here; `std::process::exit` in the surviving
+/// fork-parents skips destructors, so the ephemeral overlay file and GC
+/// root dir aren't unlinked underneath the daemon.
+///
+/// Caveat: `kill PID` against the daemon will _not_ run those Drops
+/// either, leaving an orphaned libkrun child plus stale overlay/GC root.
+/// Stop a detached VM by shutting down from inside the guest, or use
+/// `pkill -f nixvm` to take the libkrun child down too.
+fn detach_into_daemon(id: uuid::Uuid) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let log_path = log_path_for(id);
+    if let Some(dir) = log_path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
+    }
+    eprintln!("nixvm: detached, log: {}", log_path.display());
+
+    // First fork: original process exits so the user's shell prompt returns.
+    // The intermediate child does setsid and re-forks; the grandchild is the
+    // surviving daemon.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        bail!("first fork: {}", std::io::Error::last_os_error());
+    }
+    if pid > 0 {
+        // Parent: exit without running any Drops on the stack. The daemon
+        // owns overlay/GC root cleanup from here.
+        std::process::exit(0);
+    }
+
+    // setsid detaches from the controlling TTY: SIGHUP from the original
+    // shell session can't reach us anymore.
+    if unsafe { libc::setsid() } < 0 {
+        bail!("setsid: {}", std::io::Error::last_os_error());
+    }
+
+    // Second fork so the surviving daemon is not a session leader and can
+    // never reacquire a controlling TTY by accident (Stevens APUE §13.3).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        bail!("second fork: {}", std::io::Error::last_os_error());
+    }
+    if pid > 0 {
+        std::process::exit(0);
+    }
+
+    // We're the daemon. Rewire stdio. Tracing was init'd
+    // `with_writer(std::io::stderr)`, which resolves to fd 2 on every write
+    // — so dup2'ing fd 2 to the log file routes all subsequent tracing
+    // output there without re-initialising the subscriber.
+    let log = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&log_path)
+        .with_context(|| format!("open {}", log_path.display()))?;
+    let devnull = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .context("open /dev/null")?;
+    unsafe {
+        if libc::dup2(devnull.as_raw_fd(), 0) < 0 {
+            bail!("dup2 stdin: {}", std::io::Error::last_os_error());
+        }
+        if libc::dup2(log.as_raw_fd(), 1) < 0 {
+            bail!("dup2 stdout: {}", std::io::Error::last_os_error());
+        }
+        if libc::dup2(log.as_raw_fd(), 2) < 0 {
+            bail!("dup2 stderr: {}", std::io::Error::last_os_error());
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".local/state")
+    // log + devnull drop here; their underlying fds close, but fd 0/1/2
+    // hold independent dup'd file descriptions and stay open.
+    info!(pid = std::process::id(), log = %log_path.display(), "daemonized");
+    Ok(())
 }
 
 /// Stable per-image directory name for persistent GC roots. Hashes the
@@ -303,8 +411,8 @@ fn persistent_root_dir(image: &Path) -> PathBuf {
     let abs = std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     abs.hash(&mut hasher);
-    xdg_state_home()
-        .join("nixvm/roots")
+    state_dir()
+        .join("roots")
         .join(format!("{:016x}", hasher.finish()))
 }
 
@@ -323,7 +431,7 @@ struct GcRoot {
 
 impl GcRoot {
     fn ephemeral(closure_info: &Path, id: uuid::Uuid) -> Result<Self> {
-        let dir = xdg_state_home().join(format!("nixvm/transient/{id}"));
+        let dir = state_dir().join("transient").join(id.to_string());
         add_gc_root(closure_info, &dir)?;
         Ok(Self {
             dir,

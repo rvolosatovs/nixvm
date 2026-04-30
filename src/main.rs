@@ -64,6 +64,14 @@ enum Command {
         #[arg(short = 'f', long = "force", requires = "persist")]
         force: bool,
 
+        /// Run headless: detach from the controlling TTY after setup and
+        /// run the VM as a launchd-owned daemon. Stdout/stderr go to a
+        /// per-launch log under `~/Library/Application Support/nixvm/logs/`
+        /// (the path is also printed on detach). Stop the VM by shutting
+        /// down from inside the guest, or `pkill -f nixvm`.
+        #[arg(short = 'd', long = "detach")]
+        detach: bool,
+
         /// Number of vCPUs to allocate to the guest.
         #[arg(long, default_value_t = 2)]
         cpus: u8,
@@ -76,6 +84,10 @@ enum Command {
     Load {
         /// Path to a previously-saved image (from `nixvm run -p`).
         path: PathBuf,
+
+        /// Run headless. See `nixvm run --detach`.
+        #[arg(short = 'd', long = "detach")]
+        detach: bool,
 
         #[arg(long, default_value_t = 2)]
         cpus: u8,
@@ -106,6 +118,7 @@ fn main() -> ExitCode {
             tarball_ttl,
             persist,
             force,
+            detach,
             cpus,
             memory_mib,
         } => parse_pairs("--override-input", override_input)
@@ -121,16 +134,19 @@ fn main() -> ExitCode {
                     tarball_ttl,
                     persist,
                     force,
+                    detach,
                     cpus,
                     memory_mib,
                 })
             }),
         Command::Load {
             path,
+            detach,
             cpus,
             memory_mib,
         } => nixvm::load(nixvm::LoadArgs {
             path,
+            detach,
             cpus,
             memory_mib,
         }),
