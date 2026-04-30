@@ -39,10 +39,8 @@ enum Command {
 
         /// Set a Nix configuration option. Repeatable. Same syntax as
         /// `nix --option NAME VALUE` (e.g. `--option substitute false`,
-        /// `--option connect-timeout 5`). Most `libfetchers` options
-        /// (e.g. `tarball-ttl`) are not reachable through this path on
-        /// macOS — use the dedicated flag (e.g. `--tarball-ttl`) for
-        /// those.
+        /// `--option connect-timeout 5`). Unknown names warn and are
+        /// skipped, matching `nix --option <unknown>`.
         #[arg(
             long = "option",
             value_names = ["NAME", "VALUE"],

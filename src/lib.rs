@@ -40,20 +40,12 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/sys_bindings.rs"));
 }
 
-// Per-instance fetcher-settings constructor + setter. See
-// `c_src/nix_setting_shim.cc` — `nix_fetchers_settings_new` upstream
-// is move-from-temporary unsafe and `nix_setting_set` doesn't reach
-// fetcher options.
+// Per-instance fetcher-settings constructor that fixes upstream's
+// move-from-temporary segfault. See `c_src/nix_setting_shim.cc`.
 unsafe extern "C" {
     fn nixvm_fetchers_settings_new(
         ctx: *mut nix_sys::nix_c_context,
     ) -> *mut nix_sys::nix_fetchers_settings;
-    fn nixvm_fetchers_settings_set(
-        ctx: *mut nix_sys::nix_c_context,
-        settings: *mut nix_sys::nix_fetchers_settings,
-        name: *const c_char,
-        value: *const c_char,
-    ) -> nix_sys::nix_err;
 }
 
 #[derive(Debug, Clone)]
@@ -64,12 +56,12 @@ pub struct RunArgs {
     pub overrides: Vec<(String, String)>,
     /// `(name, value)` pairs from `--option NAME VALUE`, applied via
     /// `nix_setting_set` before libstore/libexpr init. Mirrors
-    /// `nix --option`. Settings the C API can't reach (notably most
-    /// `libfetchers` options on macOS) are warned about and skipped
-    /// rather than fatal — same behavior as `nix --option <unknown>`.
+    /// `nix --option`. Unknown names warn and are skipped rather than
+    /// fatal — same behavior as `nix --option <unknown>`.
     pub settings: Vec<(String, String)>,
-    /// `--tarball-ttl SECONDS`. Applied to the `nix_fetchers_settings`
-    /// instance used for flake locking. Mirrors `nix --tarball-ttl`.
+    /// `--tarball-ttl SECONDS`. Applied via `nix_setting_set` against
+    /// `globalConfig` (where libstore registers it). Mirrors
+    /// `nix --tarball-ttl`.
     pub tarball_ttl: Option<u32>,
     /// If `Some`, copy the image to this path and keep it across exit.
     /// Resume later with `nixvm load <path>`.
@@ -477,14 +469,11 @@ fn nix_realise_image(
         ctx.check().context("enable experimental flakes feature")?;
 
         // User-supplied `--option NAME VALUE`. Applied here, before
-        // libstore/libexpr init, against `globalConfig`. Reaches
-        // settings registered by libutil/libstore/libexpr/libflake
-        // (e.g. `connect-timeout`, `substitute`, `accept-flake-config`).
-        // libfetchers settings (`tarball-ttl`, `access-tokens`, etc.)
-        // are not registered with `globalConfig` from the C API on
-        // macOS — for those, see `--tarball-ttl` and the per-instance
-        // `nixvm_fetchers_settings_set` path below. Unknown/unreachable
-        // names warn and are skipped, matching `nix --option <unknown>`.
+        // libstore/libexpr init, against `globalConfig`. Reaches every
+        // `Config` registered via `GlobalConfig::Register` — that
+        // includes libutil/libstore/libexpr/libflake settings and the
+        // global `nix::fetchSettings`. Unknown names warn and are
+        // skipped, matching `nix --option <unknown>`.
         for (name, value) in settings {
             let key = CString::new(name.as_str())
                 .with_context(|| format!("--option name `{name}` contains a NUL byte"))?;
@@ -494,6 +483,17 @@ fn nix_realise_image(
             if let Err(e) = ctx.check() {
                 warn!("ignoring `--option {name} {value}`: {e:#}");
             }
+        }
+
+        // `tarball-ttl` lives on libstore's `nix::settings` (registered
+        // with `globalConfig`), not on `nix::fetchers::Settings`. Route
+        // it through the same `nix_setting_set` path as `--option`, but
+        // keep the error fatal — the user explicitly asked for it.
+        if let Some(ttl) = tarball_ttl {
+            let key = CString::new("tarball-ttl").unwrap();
+            let val = CString::new(ttl.to_string()).unwrap();
+            nix_sys::nix_setting_set(ctx.raw, key.as_ptr(), val.as_ptr());
+            ctx.check().context("apply --tarball-ttl")?;
         }
 
         nix_sys::nix_libstore_init(ctx.raw);
@@ -531,15 +531,6 @@ fn nix_realise_image(
     }
     let _fetch_settings_guard =
         scopeguard(|| unsafe { nix_sys::nix_fetchers_settings_free(fetch_settings) });
-
-    if let Some(ttl) = tarball_ttl {
-        let key = CString::new("tarball-ttl").unwrap();
-        let val = CString::new(ttl.to_string()).unwrap();
-        unsafe {
-            nixvm_fetchers_settings_set(ctx.raw, fetch_settings, key.as_ptr(), val.as_ptr());
-        }
-        ctx.check().context("apply --tarball-ttl")?;
-    }
 
     let builder = unsafe { nix_sys::nix_eval_state_builder_new(ctx.raw, store) };
     ctx.check().context("nix_eval_state_builder_new")?;
