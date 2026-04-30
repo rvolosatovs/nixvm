@@ -134,8 +134,12 @@ in
     ];
     # agetty's environment is what the login shell inherits — set TERM here
     # so readline/bash use modern escape sequences matching most host
-    # terminals (kitty, iTerm, Terminal.app).
-    systemd.services."getty@hvc0".environment.TERM = "xterm-256color";
+    # terminals (kitty, iTerm, Terminal.app). systemd-getty-generator sees
+    # `console=hvc0` on the cmdline and spawns `serial-getty@hvc0`, not
+    # `getty@hvc0`, so the override has to land on the serial template
+    # instance — otherwise agetty falls through to its hardcoded default
+    # for non-`tty*` lines (vt220 in current util-linux).
+    systemd.services."serial-getty@hvc0".environment.TERM = "xterm-256color";
     users.users.root.initialHashedPassword = lib.mkDefault "";
 
     # ---- Networking ---------------------------------------------------------
