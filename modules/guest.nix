@@ -49,8 +49,6 @@ in
     # No bootloader and no UKI: nixvm boots the kernel directly with
     # krun_set_kernel, supplying its own cmdline.
     boot.loader.grub.enable = lib.mkDefault false;
-    boot.loader.systemd-boot.enable = lib.mkDefault false;
-    boot.loader.efi.canTouchEfiVariables = lib.mkDefault false;
 
     # libkrun's implicit virtio-console is auto-wired to the host's fd 0/1/2.
     boot.kernelParams = [ "console=hvc0" ];
@@ -96,11 +94,37 @@ in
     # Automatic GC is fundamentally incompatible with the /nix/store overlay:
     # the rw upper is a tmpfs wiped on every boot, so periodic GC has nothing
     # durable to clean, and any path eligible for deletion that lives on the
-    # virtiofs (ro) lower fails with ENETDOWN ("Network dropped connection")
-    # when nix tries to chmod it for unlink. Leave it off by default; users
-    # can still run `nix-collect-garbage` manually if they understand the
-    # caveats.
-    nix.gc.automatic = lib.mkDefault false;
+    # virtiofs (ro) lower fails with EOPNOTSUPP from fchmodat2 (overlayfs
+    # tries to chmod the lower entry to make it accessible for unlink, and
+    # virtiofs rejects the chmod). Upstream already defaults this off; assert
+    # it stays off so a user image can't silently re-introduce a broken
+    # nix-gc.service.
+    assertions = [
+      {
+        assertion = !config.nix.gc.automatic;
+        message = ''
+          nixvm guest: `nix.gc.automatic = true` is unsupported.
+          /nix/store is an overlay (virtiofs ro lower ∪ tmpfs rw upper);
+          nix-gc fails with `fchmodat2: Operation not supported` whenever
+          a path eligible for deletion lives on the virtiofs lower, and
+          the rw upper is wiped every boot anyway, so periodic GC has
+          nothing durable to clean. The host's nixvm process keeps the
+          system closure rooted via /nix/var/nix/gcroots/auto/, so guest
+          GC would not free anything visible to the host either.
+        '';
+      }
+      {
+        assertion = !(builtins.elem "ro" config.boot.nixStoreMountOpts);
+        message = ''
+          nixvm guest: `boot.nixStoreMountOpts` must not contain "ro".
+          /nix/store is an overlay whose writable upper is mounted in the
+          initrd. NixOS's post-stage-2 re-bind would stack a read-only
+          overlay on top of that writable one, so every guest write to
+          /nix/store (home-manager activation, nix-env, GC roots) fails
+          with EROFS.
+        '';
+      }
+    ];
 
     # ---- Filesystems --------------------------------------------------------
     fileSystems."/".device = "/dev/disk/by-partlabel/nixos";
@@ -144,15 +168,15 @@ in
 
     # ---- Networking ---------------------------------------------------------
     # nixvm wires virtio-net to vmnet (Apple's framework). Vmnet shared mode
-    # runs a built-in DHCP server, so just enable the client.
-    networking.useDHCP = lib.mkDefault true;
+    # runs a built-in DHCP server. networking.useDHCP defaults true upstream;
+    # we only need to drop the firewall (default-on upstream) for the
+    # smoke-test UX.
     networking.firewall.enable = lib.mkDefault false;
 
     # ---- Image build (systemd-repart, no runInLinuxVM) ---------------------
     # Single ext4 root partition — no ESP, no UKI: nixvm passes kernel +
-    # initrd to libkrun directly from the host's /nix/store.
-    image.repart.name = lib.mkDefault config.system.image.id;
-
+    # initrd to libkrun directly from the host's /nix/store. image.repart.name
+    # already defaults to config.system.image.id upstream.
     image.repart.partitions."10-root".repartConfig.Type = "root";
     image.repart.partitions."10-root".repartConfig.Format = "ext4";
     image.repart.partitions."10-root".repartConfig.Label = "nixos";
