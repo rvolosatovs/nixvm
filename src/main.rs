@@ -124,11 +124,7 @@ enum Command {
 
         /// Tarball-cache TTL in seconds. Mirrors `nix --tarball-ttl`.
         /// Only meaningful when `<flake_ref>` is given.
-        #[arg(
-            long = "tarball-ttl",
-            value_name = "SECONDS",
-            requires = "flake_ref",
-        )]
+        #[arg(long = "tarball-ttl", value_name = "SECONDS", requires = "flake_ref")]
         tarball_ttl: Option<u32>,
 
         /// Run headless. See `nixvm run --detach`.

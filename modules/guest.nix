@@ -132,29 +132,14 @@ in
       "--keep-baud"
       "--noclear"
     ];
-    # agetty's environment is what the login shell inherits — set TERM here
-    # so readline/bash use modern escape sequences matching most host
-    # terminals (kitty, iTerm, Terminal.app). systemd-getty-generator sees
-    # `console=hvc0` on the cmdline and spawns `serial-getty@hvc0`, not
-    # `getty@hvc0`, so the override has to ride on the serial template.
-    #
-    # It must land on the template (`serial-getty@`), not the instance
-    # (`serial-getty@hvc0`): NixOS materialises an instance override as a
-    # standalone `/etc/systemd/system/serial-getty@hvc0.service`, which
-    # preempts the upstream template that carries `Restart=always`. Login
-    # still works because NixOS' ExecStart override lives in the template's
-    # drop-in directory and is merged in regardless, but with `Restart=`
-    # falling back to its `no` default the unit never respawns after
-    # logout — pressing ^D drops the user into a dead TTY.
-    systemd.services."serial-getty@".environment.TERM = "xterm-256color";
-    # The default ncurses terminfo set is minimal (linux, vt100, dumb, …)
-    # and lacks xterm-256color, so /etc/set-environment's `export TERM=$TERM`
-    # warns at every shell start. `enableAllTerminfo` covers most modern
-    # terminals (kitty, wezterm, ghostty, foot, alacritty, …) but not
-    # xterm — we need that one explicitly to satisfy the default TERM we
-    # set on serial-getty above.
+    # nixvm forwards the host's $TERM into the guest as
+    # `systemd.setenv=TERM=…` on the kernel cmdline, so the login shell
+    # picks up the same terminal type the host is using. The default
+    # ncurses terminfo set is minimal (linux, vt100, dumb, …), so without
+    # this `enableAllTerminfo` covers the popular modern emulators (kitty,
+    # wezterm, ghostty, foot, alacritty, …) and prevents `export TERM=…`
+    # in /etc/set-environment from warning at shell start.
     environment.enableAllTerminfo = lib.mkDefault true;
-    environment.systemPackages = [ pkgs.xterm.terminfo ];
     users.users.root.initialHashedPassword = lib.mkDefault "";
 
     # ---- Networking ---------------------------------------------------------

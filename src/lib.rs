@@ -188,13 +188,9 @@ pub fn load(args: LoadArgs) -> Result<u8> {
 
     let (toplevel, closure_info) = if let Some(flake_ref) = &args.flake_ref {
         debug!(flake = %flake_ref, "evaluating + realising flake output");
-        let realised = nix_realise_image(
-            flake_ref,
-            &args.overrides,
-            &args.settings,
-            args.tarball_ttl,
-        )
-        .context("failed to evaluate or realise the flake output")?;
+        let realised =
+            nix_realise_image(flake_ref, &args.overrides, &args.settings, args.tarball_ttl)
+                .context("failed to evaluate or realise the flake output")?;
         debug!(
             toplevel = %realised.toplevel.display(),
             closure_info = %realised.closure_info.display(),
@@ -296,12 +292,23 @@ fn boot_inputs_from_toplevel(toplevel: &Path, closure_info: &Path) -> Result<Boo
     // Mirrors NixOS UKI cmdline (`init=$toplevel/init <kernelParams>`)
     // plus the `regInfo=` channel qemu-vm.nix uses to deliver the
     // closure registration file path to the guest.
-    let cmdline = format!(
+    let mut cmdline = format!(
         "init={}/init {} regInfo={}/registration",
         toplevel.display(),
         kernel_params,
         closure_info.display(),
     );
+    // Forward the host's TERM into the guest via systemd's manager
+    // environment (parsed from `/proc/cmdline` at PID 1 startup and
+    // inherited by every spawned service, including serial-getty@hvc0).
+    // Skipped when unset or empty so the guest falls back to whatever
+    // agetty defaults to.
+    if let Ok(term) = std::env::var("TERM") {
+        if !term.is_empty() {
+            use std::fmt::Write;
+            let _ = write!(cmdline, " systemd.setenv=TERM={term}");
+        }
+    }
     Ok(BootInputs {
         kernel,
         initrd,
