@@ -141,10 +141,13 @@ in
     # for non-`tty*` lines (vt220 in current util-linux).
     systemd.services."serial-getty@hvc0".environment.TERM = "xterm-256color";
     # The default ncurses terminfo set is minimal (linux, vt100, dumb, …)
-    # and lacks xterm-256color, so /etc/set-environment's `tput`-style
-    # lookup warns at every shell start. Pull in the full set so any TERM
-    # the host might propagate (kitty, wezterm, ghostty, …) resolves.
+    # and lacks xterm-256color, so /etc/set-environment's `export TERM=$TERM`
+    # warns at every shell start. `enableAllTerminfo` covers most modern
+    # terminals (kitty, wezterm, ghostty, foot, alacritty, …) but not
+    # xterm — we need that one explicitly to satisfy the default TERM we
+    # set on serial-getty above.
     environment.enableAllTerminfo = lib.mkDefault true;
+    environment.systemPackages = [ pkgs.xterm.terminfo ];
     users.users.root.initialHashedPassword = lib.mkDefault "";
 
     # ---- Networking ---------------------------------------------------------
