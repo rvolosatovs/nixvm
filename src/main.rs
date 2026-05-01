@@ -20,9 +20,9 @@ enum Command {
     /// Build a flake's image and boot it.
     Run {
         /// Flake reference, e.g. `github:user/repo` or
-        /// `path:./examples#nixosConfigurations.test`. The attribute path
-        /// must point to a NixOS configuration; if omitted, defaults to
-        /// `nixosConfigurations.default`.
+        /// `path:./examples#myhost`. The fragment names a
+        /// `nixosConfigurations.<name>` entry (matches `nixos-rebuild
+        /// --flake`); defaults to `default` when omitted.
         flake_ref: String,
 
         /// Override a flake input. Repeatable. Same syntax as

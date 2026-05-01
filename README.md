@@ -85,7 +85,7 @@ directly. For example,
 nixvm-ready variant of its baseline NixOS module:
 
 ```sh
-nixvm run --override-input nixvm . github:rvolosatovs/nixelium#nixosConfigurations.linux-aarch64-vm-nixvm
+nixvm run --override-input nixvm . github:rvolosatovs/nixelium#aarch64-vm-nixvm
 ```
 
 (The `--override-input nixvm .` points the upstream flake's `nixvm`

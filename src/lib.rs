@@ -751,12 +751,14 @@ fn nix_realise_image(
             .with_context(|| format!("parse flake ref `{flake_uri}`"))?;
     let _flake_ref_guard = scopeguard(|| unsafe { nix_sys::nix_flake_reference_free(flake_ref) });
 
-    // Match the old default: bare flake-ref (no `#`) → `nixosConfigurations.default`.
-    let attr_path = if fragment.is_empty() {
-        "nixosConfigurations.default".to_string()
+    // `#name` → `nixosConfigurations.name`, matching `nixos-rebuild --flake`.
+    // Bare flake-ref (no `#`) defaults the name to `default`.
+    let name = if fragment.is_empty() {
+        "default"
     } else {
-        fragment
+        &fragment
     };
+    let attr_path = format!("nixosConfigurations.{name}");
 
     // Lock flags: virtual mode (lock in memory, never write to disk) plus
     // any `--override-input` entries.
