@@ -136,10 +136,17 @@ in
     # so readline/bash use modern escape sequences matching most host
     # terminals (kitty, iTerm, Terminal.app). systemd-getty-generator sees
     # `console=hvc0` on the cmdline and spawns `serial-getty@hvc0`, not
-    # `getty@hvc0`, so the override has to land on the serial template
-    # instance — otherwise agetty falls through to its hardcoded default
-    # for non-`tty*` lines (vt220 in current util-linux).
-    systemd.services."serial-getty@hvc0".environment.TERM = "xterm-256color";
+    # `getty@hvc0`, so the override has to ride on the serial template.
+    #
+    # It must land on the template (`serial-getty@`), not the instance
+    # (`serial-getty@hvc0`): NixOS materialises an instance override as a
+    # standalone `/etc/systemd/system/serial-getty@hvc0.service`, which
+    # preempts the upstream template that carries `Restart=always`. Login
+    # still works because NixOS' ExecStart override lives in the template's
+    # drop-in directory and is merged in regardless, but with `Restart=`
+    # falling back to its `no` default the unit never respawns after
+    # logout — pressing ^D drops the user into a dead TTY.
+    systemd.services."serial-getty@".environment.TERM = "xterm-256color";
     # The default ncurses terminfo set is minimal (linux, vt100, dumb, …)
     # and lacks xterm-256color, so /etc/set-environment's `export TERM=$TERM`
     # warns at every shell start. `enableAllTerminfo` covers most modern
