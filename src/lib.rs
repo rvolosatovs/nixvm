@@ -185,8 +185,7 @@ pub fn load(args: LoadArgs) -> Result<u8> {
 
     let boot = boot_inputs_from_toplevel(&realised.toplevel, &realised.closure_info)
         .context("derive kernel/initrd/cmdline from toplevel")?;
-    let gc_root =
-        GcRoot::install(&realised.closure_info, id).context("install GC root")?;
+    let gc_root = GcRoot::install(&realised.closure_info, id).context("install GC root")?;
 
     if args.detach {
         detach_into_daemon(id).context("detach into daemon")?;
