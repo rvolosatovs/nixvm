@@ -1201,7 +1201,6 @@ struct Vmnet {
     pub libkrun_fd: OwnedFd,
     pub mac: [u8; 6],
     pub mtu: u16,
-    pub max_packet_size: usize,
 }
 
 impl Vmnet {
@@ -1339,7 +1338,6 @@ impl Vmnet {
             libkrun_fd,
             mac: params.mac,
             mtu: params.mtu,
-            max_packet_size: params.max_packet_size,
         })
     }
 }
