@@ -13,7 +13,6 @@ ROOT      := $(CURDIR)
 PREFIX    := $(ROOT)/build/prefix
 PKG_CONF  := $(PREFIX)/lib/pkgconfig
 LIBKRUN   := vendor/libkrun
-LIBKRUN_PC := $(PKG_CONF)/libkrun.pc
 
 CARGO_ENV := PKG_CONFIG_PATH=$(PKG_CONF):$$PKG_CONFIG_PATH \
              LIBRARY_PATH=$(PREFIX)/lib:$$LIBRARY_PATH \
@@ -23,27 +22,21 @@ ENTITLEMENTS := entitlements.plist
 
 .PHONY: all debug libkrun install clean distclean
 
-all: $(LIBKRUN_PC)
+all: libkrun
 	$(CARGO_ENV) cargo build --release
 	# libkrun calls Hypervisor.framework, which requires the binary to be
 	# codesigned with `com.apple.security.hypervisor`. Ad-hoc sign in place.
 	codesign --force --sign - --entitlements $(ENTITLEMENTS) target/release/nixvm
 
-debug: $(LIBKRUN_PC)
+debug: libkrun
 	$(CARGO_ENV) cargo build
 	codesign --force --sign - --entitlements $(ENTITLEMENTS) target/debug/nixvm
 
-libkrun: $(LIBKRUN_PC)
-
-install: $(LIBKRUN_PC)
-	$(CARGO_ENV) cargo install --path . --locked
-	# `cargo install` strips the codesignature applied to the cached
-	# target/release/nixvm. Re-sign the installed copy so libkrun can call
-	# Hypervisor.framework.
-	codesign --force --sign - --entitlements $(ENTITLEMENTS) \
-	  "$${CARGO_INSTALL_ROOT:-$${CARGO_HOME:-$$HOME/.cargo}}/bin/nixvm"
-
-$(LIBKRUN_PC):
+# Always recurse into the submodule — libkrun's own Makefile + cargo
+# fast-path when nothing changed (~1s overhead). A stamp-file dependency
+# would let edits to vendor/libkrun/**/*.rs go undetected and ship a
+# binary linked against a stale dylib in $(PREFIX)/lib.
+libkrun:
 	# Pass PREFIX during build too: libkrun runs install_name_tool at build
 	# time (not install time), so the resulting dylib has the install_name
 	# baked in. Without PREFIX, it defaults to /usr/local.
@@ -53,6 +46,14 @@ $(LIBKRUN_PC):
 	# produces libkrun-efi.dylib). Add a `libkrun.dylib` symlink so the
 	# linker resolves `-lkrun` to the EFI variant; leaves the .pc untouched.
 	ln -sf libkrun-efi.dylib $(PREFIX)/lib/libkrun.dylib
+
+install: libkrun
+	$(CARGO_ENV) cargo install --path . --locked
+	# `cargo install` strips the codesignature applied to the cached
+	# target/release/nixvm. Re-sign the installed copy so libkrun can call
+	# Hypervisor.framework.
+	codesign --force --sign - --entitlements $(ENTITLEMENTS) \
+	  "$${CARGO_INSTALL_ROOT:-$${CARGO_HOME:-$$HOME/.cargo}}/bin/nixvm"
 
 clean:
 	cargo clean
