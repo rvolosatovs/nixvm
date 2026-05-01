@@ -81,6 +81,17 @@ pub struct RunArgs {
 pub struct LoadArgs {
     /// Existing image to boot in place. Writes are persisted back to it.
     pub path: PathBuf,
+    /// Optional flake reference. When `Some`, realise it and boot the
+    /// existing image against the new closure (refreshing sidecar + GC
+    /// root). When `None`, boot against whatever the sidecar already
+    /// records — the original `nixvm run -p` semantics.
+    pub flake_ref: Option<String>,
+    /// Like `RunArgs::overrides`. Ignored unless `flake_ref` is `Some`.
+    pub overrides: Vec<(String, String)>,
+    /// Like `RunArgs::settings`. Ignored unless `flake_ref` is `Some`.
+    pub settings: Vec<(String, String)>,
+    /// Like `RunArgs::tarball_ttl`. Ignored unless `flake_ref` is `Some`.
+    pub tarball_ttl: Option<u32>,
     pub detach: bool,
     pub cpus: u8,
     pub memory_mib: u32,
@@ -159,29 +170,70 @@ pub fn run(args: RunArgs) -> Result<u8> {
 
 /// Boot a previously-saved image (from `nixvm run -p`) in place. Writes
 /// during the run mutate the file; resume by running `load` again.
+///
+/// If `args.flake_ref` is `Some`, the flake is realised and the image is
+/// booted against that new closure — the sidecar and GC root are updated
+/// to point at it, and the previously-rooted closure becomes host-GC
+/// eligible. The image file itself is not touched, so on-disk state
+/// (`/var`, `/etc`, `/home`) carries forward. Compatibility constraints
+/// match `nixos-rebuild boot` followed by reboot on bare metal: NixOS
+/// activation handles the migration on next boot, and a wildly broken
+/// closure can leave the image in a bad state (recoverable by re-running
+/// `nixvm load PATH <known-good-flake>`).
 pub fn load(args: LoadArgs) -> Result<u8> {
     let id = uuid::Uuid::now_v7();
     info!(%id, "starting");
 
     let overlay = Overlay::load(args.path.clone()).context("failed to open image")?;
-    let (toplevel, closure_info) = read_sidecar(&overlay.path)?;
+
+    let (toplevel, closure_info) = if let Some(flake_ref) = &args.flake_ref {
+        debug!(flake = %flake_ref, "evaluating + realising flake output");
+        let realised = nix_realise_image(
+            flake_ref,
+            &args.overrides,
+            &args.settings,
+            args.tarball_ttl,
+        )
+        .context("failed to evaluate or realise the flake output")?;
+        debug!(
+            toplevel = %realised.toplevel.display(),
+            closure_info = %realised.closure_info.display(),
+            "realised",
+        );
+        // Overwrite the sidecar so a later `nixvm load PATH` (no flake)
+        // resumes against this newer closure. `nix_realise_image` also
+        // builds the disk image derivation as a side effect; we drop
+        // `realised.image_file` here because the existing image at
+        // `args.path` is the writable state container — the image-build
+        // output is unused (and host-GC eligible since we don't root it).
+        write_sidecar(&overlay.path, &realised.toplevel, &realised.closure_info)
+            .context("update image sidecar")?;
+        (realised.toplevel, realised.closure_info)
+    } else {
+        read_sidecar(&overlay.path)?
+    };
+
     if !toplevel.exists() {
         bail!(
-            "{} no longer exists — re-run `nixvm run -p {}` against the original flake to rebuild the closure",
+            "{} no longer exists — re-run `nixvm load {} <flake>` to rebuild the closure",
             toplevel.display(),
             args.path.display(),
         );
     }
     if !closure_info.exists() {
         bail!(
-            "{} no longer exists — re-run `nixvm run -p {}` against the original flake to rebuild the closure",
+            "{} no longer exists — re-run `nixvm load {} <flake>` to rebuild the closure",
             closure_info.display(),
             args.path.display(),
         );
     }
 
     let boot = boot_inputs_from_toplevel(&toplevel, &closure_info)
-        .context("derive kernel/initrd/cmdline from sidecar toplevel")?;
+        .context("derive kernel/initrd/cmdline from toplevel")?;
+    // Refresh the per-image persistent root to point at the (possibly
+    // updated) closureInfo. The `nix-store --add-root` indirection is
+    // atomic — when the flake changed, the old closure becomes host-GC
+    // eligible the moment this returns.
     let gc_root =
         GcRoot::persistent(&closure_info, &overlay.path).context("refresh persistent GC root")?;
 

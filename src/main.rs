@@ -81,9 +81,55 @@ enum Command {
         memory_mib: u32,
     },
     /// Boot a previously-saved image at PATH.
+    ///
+    /// Without `<flake_ref>`, the image is booted against the closure
+    /// recorded in its sidecar at `nixvm run -p` time. With `<flake_ref>`,
+    /// the flake is realised and the sidecar + GC root are refreshed
+    /// against the new closure — so on-disk state (`/var`, `/etc`,
+    /// `/home`) is preserved while the underlying NixOS is updated.
+    /// Compatibility constraints are the same as `nixos-rebuild boot`
+    /// followed by reboot on bare metal.
     Load {
         /// Path to a previously-saved image (from `nixvm run -p`).
         path: PathBuf,
+
+        /// Optional flake reference. When present, realises the flake and
+        /// boots the existing image against the new closure. Same syntax
+        /// as `nixvm run`'s flake_ref.
+        flake_ref: Option<String>,
+
+        /// Override a flake input. Repeatable. Same syntax as
+        /// `nix build --override-input KEY URI`. Only meaningful when
+        /// `<flake_ref>` is given.
+        #[arg(
+            long = "override-input",
+            value_names = ["KEY", "URI"],
+            num_args = 2,
+            action = clap::ArgAction::Append,
+            requires = "flake_ref",
+        )]
+        override_input: Vec<String>,
+
+        /// Set a Nix configuration option. Repeatable. Same syntax as
+        /// `nix --option NAME VALUE`. Only meaningful when `<flake_ref>`
+        /// is given.
+        #[arg(
+            long = "option",
+            value_names = ["NAME", "VALUE"],
+            num_args = 2,
+            action = clap::ArgAction::Append,
+            requires = "flake_ref",
+        )]
+        option: Vec<String>,
+
+        /// Tarball-cache TTL in seconds. Mirrors `nix --tarball-ttl`.
+        /// Only meaningful when `<flake_ref>` is given.
+        #[arg(
+            long = "tarball-ttl",
+            value_name = "SECONDS",
+            requires = "flake_ref",
+        )]
+        tarball_ttl: Option<u32>,
 
         /// Run headless. See `nixvm run --detach`.
         #[arg(short = 'd', long = "detach")]
@@ -141,15 +187,30 @@ fn main() -> ExitCode {
             }),
         Command::Load {
             path,
+            flake_ref,
+            override_input,
+            option,
+            tarball_ttl,
             detach,
             cpus,
             memory_mib,
-        } => nixvm::load(nixvm::LoadArgs {
-            path,
-            detach,
-            cpus,
-            memory_mib,
-        }),
+        } => parse_pairs("--override-input", override_input)
+            .and_then(|overrides| {
+                let settings = parse_pairs("--option", option)?;
+                Ok((overrides, settings))
+            })
+            .and_then(|(overrides, settings)| {
+                nixvm::load(nixvm::LoadArgs {
+                    path,
+                    flake_ref,
+                    overrides,
+                    settings,
+                    tarball_ttl,
+                    detach,
+                    cpus,
+                    memory_mib,
+                })
+            }),
     };
 
     match result {
