@@ -81,16 +81,10 @@ pub struct RunArgs {
 pub struct LoadArgs {
     /// Existing image to boot in place. Writes are persisted back to it.
     pub path: PathBuf,
-    /// Optional flake reference. When `Some`, realise it and boot the
-    /// existing image against the new closure (refreshing sidecar + GC
-    /// root). When `None`, boot against whatever the sidecar already
-    /// records — the original `nixvm run -p` semantics.
-    pub flake_ref: Option<String>,
-    /// Like `RunArgs::overrides`. Ignored unless `flake_ref` is `Some`.
+    /// Flake reference to realise and boot the existing image against.
+    pub flake_ref: String,
     pub overrides: Vec<(String, String)>,
-    /// Like `RunArgs::settings`. Ignored unless `flake_ref` is `Some`.
     pub settings: Vec<(String, String)>,
-    /// Like `RunArgs::tarball_ttl`. Ignored unless `flake_ref` is `Some`.
     pub tarball_ttl: Option<u32>,
     pub detach: bool,
     pub cpus: u8,
@@ -143,21 +137,10 @@ pub fn run(args: RunArgs) -> Result<u8> {
     .context("failed to prepare overlay")?;
 
     // GC-root the closure on the host so a host-side `nix-collect-garbage`
-    // can't drop paths the running guest is reading via virtiofs. For
-    // persistent images we also write a sidecar so a later `nixvm load`
-    // can recover toplevel/closureInfo without re-evaluating the flake.
-    let gc_root = match overlay.mode {
-        OverlayMode::Persistent => {
-            write_sidecar(&overlay.path, &realised.toplevel, &realised.closure_info)
-                .context("write image sidecar")?;
-            GcRoot::persistent(&realised.closure_info, &overlay.path)
-                .context("install persistent GC root")?
-        }
-        OverlayMode::Ephemeral => {
-            GcRoot::ephemeral(&realised.closure_info, id).context("install ephemeral GC root")?
-        }
-        OverlayMode::Loaded => unreachable!("run does not produce Loaded overlays"),
-    };
+    // can't drop paths the running guest is reading via virtiofs. The root
+    // lives only for the duration of this process — `nixvm load` re-realises
+    // the flake to root the closure again.
+    let gc_root = GcRoot::install(&realised.closure_info, id).context("install GC root")?;
 
     if args.detach {
         detach_into_daemon(id).context("detach into daemon")?;
@@ -168,70 +151,41 @@ pub fn run(args: RunArgs) -> Result<u8> {
     result
 }
 
-/// Boot a previously-saved image (from `nixvm run -p`) in place. Writes
-/// during the run mutate the file; resume by running `load` again.
-///
-/// If `args.flake_ref` is `Some`, the flake is realised and the image is
-/// booted against that new closure — the sidecar and GC root are updated
-/// to point at it, and the previously-rooted closure becomes host-GC
-/// eligible. The image file itself is not touched, so on-disk state
-/// (`/var`, `/etc`, `/home`) carries forward. Compatibility constraints
-/// match `nixos-rebuild boot` followed by reboot on bare metal: NixOS
-/// activation handles the migration on next boot, and a wildly broken
-/// closure can leave the image in a bad state (recoverable by re-running
-/// `nixvm load PATH <known-good-flake>`).
+/// Boot a previously-saved image (from `nixvm run -p`) in place against
+/// a freshly-realised flake closure. Writes during the run mutate the
+/// file; the image is the only persistent state — toplevel/closureInfo
+/// are recomputed from the flake on every load. On-disk state (`/var`,
+/// `/etc`, `/home`) carries forward; compatibility constraints match
+/// `nixos-rebuild boot` followed by reboot on bare metal.
 pub fn load(args: LoadArgs) -> Result<u8> {
     let id = uuid::Uuid::now_v7();
     info!(%id, "starting");
 
-    let overlay = Overlay::load(args.path.clone()).context("failed to open image")?;
+    let overlay = Overlay::load(args.path).context("failed to open image")?;
 
-    let (toplevel, closure_info) = if let Some(flake_ref) = &args.flake_ref {
-        debug!(flake = %flake_ref, "evaluating + realising flake output");
-        let realised =
-            nix_realise_image(flake_ref, &args.overrides, &args.settings, args.tarball_ttl)
-                .context("failed to evaluate or realise the flake output")?;
-        debug!(
-            toplevel = %realised.toplevel.display(),
-            closure_info = %realised.closure_info.display(),
-            "realised",
-        );
-        // Overwrite the sidecar so a later `nixvm load PATH` (no flake)
-        // resumes against this newer closure. `nix_realise_image` also
-        // builds the disk image derivation as a side effect; we drop
-        // `realised.image_file` here because the existing image at
-        // `args.path` is the writable state container — the image-build
-        // output is unused (and host-GC eligible since we don't root it).
-        write_sidecar(&overlay.path, &realised.toplevel, &realised.closure_info)
-            .context("update image sidecar")?;
-        (realised.toplevel, realised.closure_info)
-    } else {
-        read_sidecar(&overlay.path)?
-    };
+    debug!(flake = %args.flake_ref, "evaluating + realising flake output");
+    // `nix_realise_image` builds both the image and closureInfo
+    // derivations; we use only `closure_info` and `toplevel` here. The
+    // image-build output is host-GC eligible since we don't root it —
+    // the existing image at `overlay.path` is the writable state
+    // container.
+    let realised = nix_realise_image(
+        &args.flake_ref,
+        &args.overrides,
+        &args.settings,
+        args.tarball_ttl,
+    )
+    .context("failed to evaluate or realise the flake output")?;
+    debug!(
+        toplevel = %realised.toplevel.display(),
+        closure_info = %realised.closure_info.display(),
+        "realised",
+    );
 
-    if !toplevel.exists() {
-        bail!(
-            "{} no longer exists — re-run `nixvm load {} <flake>` to rebuild the closure",
-            toplevel.display(),
-            args.path.display(),
-        );
-    }
-    if !closure_info.exists() {
-        bail!(
-            "{} no longer exists — re-run `nixvm load {} <flake>` to rebuild the closure",
-            closure_info.display(),
-            args.path.display(),
-        );
-    }
-
-    let boot = boot_inputs_from_toplevel(&toplevel, &closure_info)
+    let boot = boot_inputs_from_toplevel(&realised.toplevel, &realised.closure_info)
         .context("derive kernel/initrd/cmdline from toplevel")?;
-    // Refresh the per-image persistent root to point at the (possibly
-    // updated) closureInfo. The `nix-store --add-root` indirection is
-    // atomic — when the flake changed, the old closure becomes host-GC
-    // eligible the moment this returns.
     let gc_root =
-        GcRoot::persistent(&closure_info, &overlay.path).context("refresh persistent GC root")?;
+        GcRoot::install(&realised.closure_info, id).context("install GC root")?;
 
     if args.detach {
         detach_into_daemon(id).context("detach into daemon")?;
@@ -273,7 +227,7 @@ fn launch_vm(
     Ok(exit_code)
 }
 
-// ── boot inputs + sidecar + GC roots ─────────────────────────────────
+// ── boot inputs + GC roots ─────────────────────────────────
 
 /// Derive `BootInputs` from a realised `system.build.toplevel`. NixOS
 /// stages the artifacts at well-known names inside the toplevel directory
@@ -314,48 +268,6 @@ fn boot_inputs_from_toplevel(toplevel: &Path, closure_info: &Path) -> Result<Boo
         initrd,
         cmdline,
     })
-}
-
-/// `<image>.nixvm` next to a persistent image. Two lines, `key path` each;
-/// no JSON to keep the dependency footprint zero.
-fn sidecar_path(image: &Path) -> PathBuf {
-    let mut p = image.as_os_str().to_owned();
-    p.push(".nixvm");
-    PathBuf::from(p)
-}
-
-fn write_sidecar(image: &Path, toplevel: &Path, closure_info: &Path) -> Result<()> {
-    let body = format!(
-        "toplevel {}\nclosureInfo {}\n",
-        toplevel.display(),
-        closure_info.display(),
-    );
-    let p = sidecar_path(image);
-    fs::write(&p, body).with_context(|| format!("write {}", p.display()))
-}
-
-fn read_sidecar(image: &Path) -> Result<(PathBuf, PathBuf)> {
-    let p = sidecar_path(image);
-    let body = fs::read_to_string(&p).with_context(|| {
-        format!(
-            "read {} (no sidecar — was this image saved by `nixvm run -p`?)",
-            p.display()
-        )
-    })?;
-    let mut toplevel: Option<PathBuf> = None;
-    let mut closure_info: Option<PathBuf> = None;
-    for line in body.lines() {
-        let mut it = line.splitn(2, ' ');
-        match (it.next(), it.next()) {
-            (Some("toplevel"), Some(v)) => toplevel = Some(PathBuf::from(v)),
-            (Some("closureInfo"), Some(v)) => closure_info = Some(PathBuf::from(v)),
-            _ => {}
-        }
-    }
-    Ok((
-        toplevel.ok_or_else(|| anyhow!("{}: missing `toplevel`", p.display()))?,
-        closure_info.ok_or_else(|| anyhow!("{}: missing `closureInfo`", p.display()))?,
-    ))
 }
 
 /// Root directory for nixvm's per-user state (GC root indirections,
@@ -462,60 +374,33 @@ fn detach_into_daemon(id: uuid::Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Stable per-image directory name for persistent GC roots. Hashes the
-/// canonical absolute image path so two `nixvm load PATH` invocations
-/// end up at the same GC root, regardless of CWD.
-fn persistent_root_dir(image: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let abs = std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    abs.hash(&mut hasher);
-    state_dir()
-        .join("roots")
-        .join(format!("{:016x}", hasher.finish()))
-}
-
 /// Holds an indirect GC root in `dir` pointing at the realised closureInfo.
 /// Rooting closureInfo transitively roots the entire system closure
 /// (closureInfo's `references` in the store metadata include every path
 /// it lists in `registration`), so `nix-collect-garbage` on the host
 /// can't drop paths the running guest reads via virtiofs.
 ///
-/// Ephemeral roots are removed on `Drop`; persistent ones are kept so a
-/// later `nixvm load` doesn't have to re-evaluate the flake.
+/// The root is removed on `Drop` — the closure becomes host-GC eligible
+/// the moment this process exits. `nixvm load` re-realises the flake to
+/// root it again.
 struct GcRoot {
     dir: PathBuf,
-    ephemeral: bool,
 }
 
 impl GcRoot {
-    fn ephemeral(closure_info: &Path, id: uuid::Uuid) -> Result<Self> {
+    fn install(closure_info: &Path, id: uuid::Uuid) -> Result<Self> {
         let dir = state_dir().join("transient").join(id.to_string());
         add_gc_root(closure_info, &dir)?;
-        Ok(Self {
-            dir,
-            ephemeral: true,
-        })
-    }
-
-    fn persistent(closure_info: &Path, image: &Path) -> Result<Self> {
-        let dir = persistent_root_dir(image);
-        add_gc_root(closure_info, &dir)?;
-        Ok(Self {
-            dir,
-            ephemeral: false,
-        })
+        Ok(Self { dir })
     }
 }
 
 impl Drop for GcRoot {
     fn drop(&mut self) {
-        if self.ephemeral {
-            // The user-space symlink disappears; the indirect root in
-            // /nix/var/nix/gcroots/auto becomes dangling and is cleaned
-            // up by the daemon on the next GC pass.
-            let _ = fs::remove_dir_all(&self.dir);
-        }
+        // The user-space symlink disappears; the indirect root in
+        // /nix/var/nix/gcroots/auto becomes dangling and is cleaned
+        // up by the daemon on the next GC pass.
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1067,20 +952,19 @@ impl Overlay {
     }
 
     /// `nixvm run -p PATH`: copy base to PATH, retain on exit. With
-    /// `force`, an existing file at PATH is unlinked first (along with
-    /// its sidecar) so the new image replaces it cleanly.
+    /// `force`, an existing file at PATH is unlinked first so the new
+    /// image replaces it cleanly.
     fn persistent(base: &Path, dest: PathBuf, force: bool) -> Result<Self> {
         if dest.exists() {
             if !force {
                 bail!(
-                    "{} already exists; pass `nixvm load {}` to resume it, or `--force` to overwrite",
+                    "{} already exists; pass `nixvm load {} <flake>` to resume it, or `--force` to overwrite",
                     dest.display(),
                     dest.display(),
                 );
             }
             fs::remove_file(&dest)
                 .with_context(|| format!("remove existing {}", dest.display()))?;
-            let _ = fs::remove_file(sidecar_path(&dest));
         }
         copy_writable(base, &dest)?;
         Ok(Self {
