@@ -14,6 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::str;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -1394,6 +1395,19 @@ use std::os::fd::FromRawFd;
 
 // ─────────────────────────── libkrun + fork ───────────────────────────
 
+/// Pid of the libkrun child, set by the parent post-fork. The parent's
+/// SIGWINCH handler reads this and forwards the signal to the child via
+/// `kill(2)` so we don't depend on the kernel choosing to deliver SIGWINCH
+/// to every member of the foreground process group.
+static LIBKRUN_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn forward_sigwinch_to_child(_: c_int) {
+    let pid = LIBKRUN_CHILD_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        unsafe { libc::kill(pid, libc::SIGWINCH) };
+    }
+}
+
 fn fork_and_run_vm(
     overlay: &Overlay,
     boot: &BootInputs,
@@ -1409,14 +1423,35 @@ fn fork_and_run_vm(
     let net_mac = vmnet.mac;
     let net_mtu = vmnet.mtu;
 
+    // Install a SIGWINCH forwarder in the parent before fork so the child
+    // inherits it; we'll reset the child's disposition to SIG_DFL right
+    // after fork (libkrun installs its own handler later in start_enter).
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = forward_sigwinch_to_child as *const () as usize;
+        libc::sigemptyset(&mut act.sa_mask);
+        // No SA_SIGINFO: forward_sigwinch_to_child takes only the signum.
+        libc::sigaction(libc::SIGWINCH, &act, std::ptr::null_mut());
+    }
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         bail!("fork: {}", std::io::Error::last_os_error());
     }
 
     if pid == 0 {
-        // Child: configure libkrun and start the VM. krun_start_enter() does
-        // not return; on failure we _exit() with a distinguishable code so
+        // Child: reset SIGWINCH to default (ignored). libkrun installs its
+        // own handler during start_enter; until then any SIGWINCH that
+        // races us is harmlessly dropped instead of triggering the
+        // parent's forwarder we just inherited.
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut act.sa_mask);
+            libc::sigaction(libc::SIGWINCH, &act, std::ptr::null_mut());
+        }
+        // Configure libkrun and start the VM. krun_start_enter() does not
+        // return; on failure we _exit() with a distinguishable code so
         // the parent can surface it.
         if let Err(err) = configure_and_start_vm(
             overlay.path.as_path(),
@@ -1436,6 +1471,9 @@ fn fork_and_run_vm(
         unsafe { libc::_exit(127) };
     }
 
+    // Parent: arm the SIGWINCH forwarder now that we know the child pid.
+    LIBKRUN_CHILD_PID.store(pid, Ordering::Relaxed);
+
     // Parent: drop our claim on stdin so the child (libkrun) is the sole
     // reader. Otherwise both processes share fd 0 and the kernel can hand
     // the same character to whichever happens to read first, which shows
@@ -1448,11 +1486,19 @@ fn fork_and_run_vm(
         }
     }
 
-    // Parent: wait for child.
+    // Parent: wait for child. Loop on EINTR — our SIGWINCH forwarder runs
+    // in the parent and unblocks waitpid every time the user resizes.
     let mut status: c_int = 0;
-    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if waited < 0 {
-        bail!("waitpid: {}", std::io::Error::last_os_error());
+    loop {
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited >= 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        bail!("waitpid: {err}");
     }
     if libc::WIFEXITED(status) {
         Ok(libc::WEXITSTATUS(status) as u8)
