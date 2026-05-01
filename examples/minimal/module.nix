@@ -4,8 +4,8 @@
 # nixvm.nixosModules.guest — this module just adds image identity and
 # stateVersion.
 {
-  system.image.id = "nixvm-test";
+  system.image.id = "minimal";
   system.image.version = "1";
   system.stateVersion = "25.11";
-  networking.hostName = "nixvm";
+  networking.hostName = "minimal";
 }

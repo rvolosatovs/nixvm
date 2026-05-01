@@ -11,7 +11,7 @@
       nixosConfigurations.default = nixpkgs.lib.nixosSystem {
         system = "aarch64-linux";
         modules = [
-          nixvm.nixosModules.guest
+          nixvm.nixosModules.default
           ./module.nix
         ];
       };
