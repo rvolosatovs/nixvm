@@ -73,11 +73,11 @@ enum Command {
         detach: bool,
 
         /// Number of vCPUs to allocate to the guest.
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = 8)]
         cpus: u8,
 
         /// Memory to allocate to the guest, in MiB.
-        #[arg(long = "memory", default_value_t = 2048)]
+        #[arg(long = "memory", default_value_t = 8192)]
         memory_mib: u32,
     },
     /// Boot a previously-saved image at PATH against a freshly-realised
@@ -119,10 +119,10 @@ enum Command {
         #[arg(short = 'd', long = "detach")]
         detach: bool,
 
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = 8)]
         cpus: u8,
 
-        #[arg(long = "memory", default_value_t = 2048)]
+        #[arg(long = "memory", default_value_t = 8192)]
         memory_mib: u32,
     },
 }
