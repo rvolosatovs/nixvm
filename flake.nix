@@ -36,6 +36,14 @@
 
           env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
+          # build.rs compiles the C++ shim via the `cc` crate, which passes an
+          # Apple LLVM triple (`arm64-apple-macosx<ver>`) as `--target`. Nixpkgs'
+          # cc-wrapper warns on any `--target` != its baked-in `arm64-apple-darwin`
+          # ("multi-target compilers"). The codegen is identical here, so silence
+          # the warning via the wrapper's own documented knob rather than swapping
+          # in an unwrapped compiler.
+          env.NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING = "1";
+
           # Point cargo at the vendored libkrun built by `make libkrun` so
           # direct `cargo` invocations (clippy, check, build, rust-analyzer)
           # work without going through the Makefile. PWD is the flake root
