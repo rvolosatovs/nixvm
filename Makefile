@@ -1,7 +1,7 @@
 # Top-level orchestration: build libkrun (vendored submodule) into a local
 # prefix, then run `cargo build` with PKG_CONFIG_PATH pointing at it.
 #
-# Use from inside `nix-shell`. Targets:
+# Use from inside `nix develop`. Targets:
 #   make            -> release nixvm binary
 #   make debug      -> debug nixvm binary
 #   make libkrun    -> just build + install libkrun into ./build/prefix

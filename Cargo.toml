@@ -22,8 +22,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 krun-sys = { path = "vendor/libkrun/krun-sys", features = ["bindgen_clang_runtime"] }
 libc = "0.2"
-rustix = { version = "1", features = ["termios", "process"] }
-tempfile = "3"
+rustix = { version = "1", features = ["termios"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7"] }
