@@ -74,14 +74,20 @@ fn main() {
     // We talk to vmnet.framework directly (in-process packet pump). Block
     // ABI lives in /usr/include via the SDK; xpc and dispatch live in
     // libSystem (no extra link flag needed).
-    let sdk = std::process::Command::new("xcrun")
-        .args(["--show-sdk-path"])
-        .output()
-        .expect("xcrun not on PATH (install Xcode CLT)");
-    let sdk_path = String::from_utf8(sdk.stdout)
-        .expect("xcrun returned non-UTF8 path")
-        .trim()
-        .to_owned();
+    println!("cargo:rerun-if-env-changed=SDKROOT");
+    let sdk_path = match env::var("SDKROOT") {
+        Ok(path) if !path.is_empty() => path,
+        _ => {
+            let sdk = std::process::Command::new("xcrun")
+                .args(["--show-sdk-path"])
+                .output()
+                .expect("xcrun not on PATH (install Xcode CLT)");
+            String::from_utf8(sdk.stdout)
+                .expect("xcrun returned non-UTF8 path")
+                .trim()
+                .to_owned()
+        }
+    };
 
     let sys_bindings = bindgen::Builder::default()
         .header_contents(

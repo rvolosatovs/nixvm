@@ -91,6 +91,16 @@ nixvm run --override-input nixvm . github:rvolosatovs/nixelium#aarch64-vm-nixvm
 (The `--override-input nixvm .` points the upstream flake's `nixvm`
 input at this checkout — drop it once you're running a tagged release.)
 
+## Install
+
+```sh
+nix shell github:rvolosatovs/nixvm   # or: nix run github:rvolosatovs/nixvm -- run …
+```
+
+The package builds the libkrun fork from the flake's `libkrun` input (kept on
+the same revision as `vendor/libkrun`) and codesigns the binary with
+`entitlements.plist`.
+
 ## Build
 
 You need a working Nix install (with the C API — Nix ≥ 2.30) and **macOS 26+**
@@ -134,13 +144,14 @@ so there's no UKI, no ESP, and no bootloader install step.
 - GUI / Wayland (planned: Weston-RDP in the guest, GPU accel via Vz/MoltenVK)
 - GPU acceleration
 - x86_64-darwin host
-- Packaging (homebrew, nix flake output for nixvm itself)
+- Packaging other than the Nix flake (homebrew, …)
 
 ## Layout
 
 ```
 .
-├── flake.nix                  # dev shell only; no nixvm packaging
+├── flake.nix                  # nixvm package + dev shell + guest module
+├── nix/                       # libkrun + nixvm derivations
 ├── Makefile                   # libkrun build + cargo build orchestration
 ├── build.rs                   # libkrun pkg-config + Nix C API + vmnet bindings
 ├── Cargo.toml

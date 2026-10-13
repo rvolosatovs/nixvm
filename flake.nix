@@ -1,23 +1,40 @@
-# Dev environment for nixvm + the shared NixOS guest module.
-#
-# Packaging nixvm itself is out of scope for the PoC (libkrun submodule build +
-# codesigning don't fit nixify's Rust flow), so this flake exposes:
+# nixvm package, dev environment and the shared NixOS guest module:
+#   - packages.aarch64-darwin.default  — `nix shell github:rvolosatovs/nixvm`
 #   - devShells.aarch64-darwin.default — `nix develop` then `make`
 #   - nixosModules.guest               — host↔guest contract for image flakes
+#
+# `github:` flake refs don't carry submodule contents, so the package takes
+# libkrun from the `libkrun` input instead of `vendor/libkrun`. CI checks that
+# the two stay on the same revision.
 {
   inputs.nixify.url = "github:rvolosatovs/nixify";
+  inputs.libkrun.url = "github:rvolosatovs/libkrun/nixvm-v1.19";
+  inputs.libkrun.flake = false;
 
   outputs =
-    { self, nixify, ... }:
+    {
+      self,
+      nixify,
+      libkrun,
+      ...
+    }:
     with nixify.lib;
     rust.mkFlake {
       src = self;
 
-      # Packaging is out of scope — drop the auto-generated rust packages,
-      # checks and apps so the flake only exposes the devShell.
-      withPackages = _: { };
+      # nixify's crane-based packages and checks can't build the vendored
+      # libkrun or codesign the binary; nix/*.nix do both.
+      withPackages =
+        { pkgs, ... }:
+        pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "aarch64-darwin") rec {
+          libkrun-efi = pkgs.callPackage ./nix/libkrun.nix { src = libkrun; };
+          nixvm = pkgs.callPackage ./nix/nixvm.nix {
+            src = self;
+            libkrun = libkrun-efi;
+          };
+          default = nixvm;
+        };
       withChecks = _: { };
-      withApps = _: { };
 
       withDevShells =
         { pkgs, devShells, ... }:
