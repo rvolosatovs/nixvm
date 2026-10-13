@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::str;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -131,9 +131,10 @@ pub fn run(args: RunArgs) -> Result<u8> {
     let boot = boot_inputs_from_toplevel(&realised.toplevel, &realised.closure_info)
         .context("derive kernel/initrd/cmdline from realised toplevel")?;
 
+    let image_file = store_path(&realised.image_file)?;
     let overlay = match args.persist {
-        Some(path) => Overlay::persistent(&realised.image_file, path, args.force),
-        None => Overlay::ephemeral(&realised.image_file, id),
+        Some(path) => Overlay::persistent(&image_file, path, args.force),
+        None => Overlay::ephemeral(&image_file, id),
     }
     .context("failed to prepare overlay")?;
 
@@ -256,14 +257,15 @@ fn boot_inputs_from_toplevel(toplevel: &Path, closure_info: &Path) -> Result<Boo
     // Skipped when unset, empty, or not a plain terminfo name (whitespace
     // or quotes would inject extra kernel parameters) so the guest falls
     // back to whatever agetty defaults to.
-    if let Ok(term) = std::env::var("TERM") {
-        if !term.is_empty()
-            && term
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c))
+    if let Some(term) = std::env::var("TERM").ok().filter(|t| !t.is_empty()) {
+        if term
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c))
         {
             use std::fmt::Write;
             let _ = write!(cmdline, " systemd.setenv=TERM={term}");
+        } else {
+            warn!(%term, "TERM is not a plain terminfo name, not forwarding it to the guest");
         }
     }
     Ok(BootInputs {
@@ -282,15 +284,18 @@ const NIX_STORE: &str = "/nix/store";
 /// could point the root disk, kernel, initrd or cmdline at any host file
 /// the user can read and hand its contents to the guest.
 fn store_path(path: &Path) -> Result<PathBuf> {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    let root = ROOT
+        .get_or_init(|| fs::canonicalize(NIX_STORE).unwrap_or_else(|_| PathBuf::from(NIX_STORE)));
     let resolved = fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?;
-    if !resolved.starts_with(NIX_STORE) {
+    let Ok(rel) = resolved.strip_prefix(root) else {
         bail!(
             "{} resolves to {}, outside {NIX_STORE}",
             path.display(),
             resolved.display(),
         );
-    }
-    Ok(resolved)
+    };
+    Ok(Path::new(NIX_STORE).join(rel))
 }
 
 /// Root directory for nixvm's per-user state (GC root indirections,
@@ -784,7 +789,7 @@ fn nix_realise_image(
     realise_drv(&ctx, store, &closure_info_drv).context("realise closureInfo drv")?;
 
     Ok(Realised {
-        image_file: store_path(Path::new(&format!("{img_out_path}/{file_name}")))?,
+        image_file: PathBuf::from(format!("{img_out_path}/{file_name}")),
         toplevel: store_path(Path::new(&toplevel_out))?,
         closure_info: store_path(Path::new(&closure_info_out))?,
     })
@@ -1351,6 +1356,11 @@ fn socketpair_dgram() -> Result<(OwnedFd, OwnedFd)> {
     Ok((pump, libkrun))
 }
 
+/// How long the vmnet callback waits for libkrun to make room in the pump
+/// socket before dropping a packet. Bounded so a wedged child cannot block
+/// the dispatch queue (and thus `vmnet_stop_interface`) forever.
+const SOCKET_WRITE_TIMEOUT_MS: c_int = 100;
+
 /// Drain everything currently sitting in vmnet into the pump socket. Called
 /// from the vmnet event callback (on the dispatch queue).
 fn drain_vmnet_to_socket(iface: sys::interface_ref, fd: RawFd, max_pkt: usize) {
@@ -1373,13 +1383,30 @@ fn drain_vmnet_to_socket(iface: sys::interface_ref, fd: RawFd, max_pkt: usize) {
             return;
         }
         // pkt.vm_pkt_size now holds the actual packet length.
-        let n = unsafe { libc::write(fd, buf.as_ptr() as *const c_void, pkt.vm_pkt_size) };
-        if n < 0 {
+        loop {
+            let n = unsafe { libc::write(fd, buf.as_ptr() as *const c_void, pkt.vm_pkt_size) };
+            if n >= 0 {
+                break;
+            }
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::EAGAIN) {
                 warn!(error = %err, "vmnet→socket write failed");
+                return;
             }
-            return;
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pfd, 1, SOCKET_WRITE_TIMEOUT_MS) };
+            if ready == 0 {
+                warn!("vmnet→socket: libkrun is not draining the socket, dropping a packet");
+                return;
+            }
+            if ready < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                warn!(error = %std::io::Error::last_os_error(), "vmnet→socket poll failed");
+                return;
+            }
         }
     }
 }
@@ -1492,6 +1519,7 @@ fn fork_and_run_vm(
 
     // Parent: arm the SIGWINCH forwarder now that we know the child pid.
     LIBKRUN_CHILD_PID.store(pid, Ordering::Relaxed);
+    let _disarm = scopeguard(|| LIBKRUN_CHILD_PID.store(0, Ordering::Relaxed));
 
     // Parent: drop our claim on stdin so the child (libkrun) is the sole
     // reader. Otherwise both processes share fd 0 and the kernel can hand
@@ -1519,7 +1547,6 @@ fn fork_and_run_vm(
         }
         bail!("waitpid: {err}");
     }
-    LIBKRUN_CHILD_PID.store(0, Ordering::Relaxed);
     if libc::WIFEXITED(status) {
         Ok(libc::WEXITSTATUS(status) as u8)
     } else if libc::WIFSIGNALED(status) {
