@@ -149,7 +149,7 @@ so there's no UKI, no ESP, and no bootloader install step.
 │   ├── main.rs                # clap CLI
 │   └── lib.rs                 # Nix eval/realise + libkrun + vmnet pump + fork
 ├── examples/minimal/          # minimal reference NixOS image fitting the contract
-└── vendor/libkrun/            # git submodule (containers/libkrun, pinned)
+└── vendor/libkrun/            # git submodule (rvolosatovs/libkrun fork, pinned)
 ```
 
 ## Limitations & known sharp edges
