@@ -157,6 +157,12 @@ so there's no UKI, no ESP, and no bootloader install step.
 
 ## Limitations & known sharp edges
 
+- The guest is not a sandbox for secrets in the host store: it gets the
+  host's *entire* `/nix/store` read-only via virtiofs, plus NAT network
+  access (including services on the host that listen on the vmnet
+  interface). Paths nixvm reads from the evaluated flake (image, kernel,
+  initrd, `kernel-params`) must resolve inside `/nix/store`.
+
 - Building takes a while on first run because libkrun's macOS build needs to
   download a Debian sysroot to cross-compile its init binary.
 - The vendored libkrun's `.pc` file says `-lkrun` even when built with

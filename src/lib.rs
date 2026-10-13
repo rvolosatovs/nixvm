@@ -235,11 +235,9 @@ fn launch_vm(
 /// `boot.kernelParams` joined by spaces) — same pattern the UKI build
 /// reads from in `nixos/modules/system/boot/uki.nix`.
 fn boot_inputs_from_toplevel(toplevel: &Path, closure_info: &Path) -> Result<BootInputs> {
-    let kernel = fs::read_link(toplevel.join("kernel"))
-        .with_context(|| format!("readlink {}/kernel", toplevel.display()))?;
-    let initrd = fs::read_link(toplevel.join("initrd"))
-        .with_context(|| format!("readlink {}/initrd", toplevel.display()))?;
-    let kernel_params = fs::read_to_string(toplevel.join("kernel-params"))
+    let kernel = store_path(&toplevel.join("kernel"))?;
+    let initrd = store_path(&toplevel.join("initrd"))?;
+    let kernel_params = fs::read_to_string(store_path(&toplevel.join("kernel-params"))?)
         .with_context(|| format!("read {}/kernel-params", toplevel.display()))?
         .trim()
         .to_string();
@@ -255,10 +253,15 @@ fn boot_inputs_from_toplevel(toplevel: &Path, closure_info: &Path) -> Result<Boo
     // Forward the host's TERM into the guest via systemd's manager
     // environment (parsed from `/proc/cmdline` at PID 1 startup and
     // inherited by every spawned service, including serial-getty@hvc0).
-    // Skipped when unset or empty so the guest falls back to whatever
-    // agetty defaults to.
+    // Skipped when unset, empty, or not a plain terminfo name (whitespace
+    // or quotes would inject extra kernel parameters) so the guest falls
+    // back to whatever agetty defaults to.
     if let Ok(term) = std::env::var("TERM") {
-        if !term.is_empty() {
+        if !term.is_empty()
+            && term
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c))
+        {
             use std::fmt::Write;
             let _ = write!(cmdline, " systemd.setenv=TERM={term}");
         }
@@ -268,6 +271,26 @@ fn boot_inputs_from_toplevel(toplevel: &Path, closure_info: &Path) -> Result<Boo
         initrd,
         cmdline,
     })
+}
+
+/// The host Nix store, shared read-only into the guest via virtiofs.
+const NIX_STORE: &str = "/nix/store";
+
+/// Resolve every symlink in `path` and require the result to live in
+/// [`NIX_STORE`]. Evaluated paths (`outPath`, `image.fileName`, symlinks
+/// inside outputs) are controlled by the flake; without this check a flake
+/// could point the root disk, kernel, initrd or cmdline at any host file
+/// the user can read and hand its contents to the guest.
+fn store_path(path: &Path) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?;
+    if !resolved.starts_with(NIX_STORE) {
+        bail!(
+            "{} resolves to {}, outside {NIX_STORE}",
+            path.display(),
+            resolved.display(),
+        );
+    }
+    Ok(resolved)
 }
 
 /// Root directory for nixvm's per-user state (GC root indirections,
@@ -761,9 +784,9 @@ fn nix_realise_image(
     realise_drv(&ctx, store, &closure_info_drv).context("realise closureInfo drv")?;
 
     Ok(Realised {
-        image_file: PathBuf::from(format!("{img_out_path}/{file_name}")),
-        toplevel: PathBuf::from(toplevel_out),
-        closure_info: PathBuf::from(closure_info_out),
+        image_file: store_path(Path::new(&format!("{img_out_path}/{file_name}")))?,
+        toplevel: store_path(Path::new(&toplevel_out))?,
+        closure_info: store_path(Path::new(&closure_info_out))?,
     })
 }
 
