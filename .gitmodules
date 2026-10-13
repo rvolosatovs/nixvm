@@ -1,3 +1,4 @@
 [submodule "vendor/libkrun"]
 	path = vendor/libkrun
-	url = https://github.com/containers/libkrun.git
+	url = https://github.com/rvolosatovs/libkrun.git
+	branch = nixvm-v1.19
