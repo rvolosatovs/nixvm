@@ -1354,9 +1354,9 @@ fn socketpair_dgram() -> Result<(OwnedFd, OwnedFd)> {
 /// Drain everything currently sitting in vmnet into the pump socket. Called
 /// from the vmnet event callback (on the dispatch queue).
 fn drain_vmnet_to_socket(iface: sys::interface_ref, fd: RawFd, max_pkt: usize) {
+    let mut buf = vec![0u8; max_pkt];
     loop {
         // Issue one vmnet_read for one packet; loop until we'd block.
-        let mut buf = vec![0u8; max_pkt];
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut c_void,
             iov_len: max_pkt,
