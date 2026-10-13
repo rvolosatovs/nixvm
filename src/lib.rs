@@ -8,7 +8,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1412,9 +1412,6 @@ fn pump_socket_to_vmnet(fd: RawFd, iface: sys::interface_ref, max_pkt: usize) {
     }
 }
 
-// Re-export for the OwnedFd construction above.
-use std::os::fd::FromRawFd;
-
 // ─────────────────────────── libkrun + fork ───────────────────────────
 
 /// Pid of the libkrun child, set by the parent post-fork. The parent's
@@ -1522,6 +1519,7 @@ fn fork_and_run_vm(
         }
         bail!("waitpid: {err}");
     }
+    LIBKRUN_CHILD_PID.store(0, Ordering::Relaxed);
     if libc::WIFEXITED(status) {
         Ok(libc::WEXITSTATUS(status) as u8)
     } else if libc::WIFSIGNALED(status) {
@@ -1599,7 +1597,7 @@ fn configure_and_start_vm(
 
     // Share the host /nix/store into the guest, read-only.
     let tag = CString::new("nixstore").unwrap();
-    let host_store = CString::new("/nix/store").unwrap();
+    let host_store = CString::new(NIX_STORE).unwrap();
     krun_check(
         unsafe {
             krun_add_virtiofs3(

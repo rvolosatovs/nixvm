@@ -5,7 +5,7 @@ Launch a Nix flake output as an ephemeral, headless Linux VM on macOS via
 guest's `/dev/hvc0`, no SSH involved.
 
 ```
-nixvm github:user/repo#some-vm-image
+nixvm run github:user/repo#some-vm-image
 ```
 
 PoC. **macOS 26+ Apple Silicon only.** Headless only. Real virtio-net
@@ -22,7 +22,7 @@ image, deleted on exit.
 nixvm
   ├── parses the flake ref
   ├── evaluates and realises the output via the upstream Nix C API
-  ├── copies the realised raw EFI image to a tempfile (the per-launch overlay)
+  ├── copies the realised raw root-fs image to a tempfile (the per-launch overlay)
   ├── opens vmnet.framework + spawns a packet-pump thread (parent only)
   ├── puts the host TTY in raw mode
   └── fork() →
@@ -110,11 +110,8 @@ incremental edits with `cargo build --release` directly (with the right
 ## Run
 
 ```sh
-# build the example image (needs a linux builder)
-nix build path:./examples/minimal#packages.aarch64-linux.default
-
-# launch it
-./target/release/nixvm path:./examples/minimal#packages.aarch64-linux.default
+# build + launch the example image (needs a linux builder)
+./target/release/nixvm run path:./examples/minimal
 ```
 
 Press `Ctrl+D` or run `poweroff` inside the guest to exit. `Ctrl+C` is
