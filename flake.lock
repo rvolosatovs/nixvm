@@ -164,6 +164,23 @@
         "type": "github"
       }
     },
+    "libkrun": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791907242,
+        "narHash": "sha256-WmJ1lOuYa+MD+OqAfeS4k3+jrnT1j5knzTFLx/N7uc4=",
+        "owner": "rvolosatovs",
+        "repo": "libkrun",
+        "rev": "775bea219e4c4a86637e5597a38116f679f0875d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rvolosatovs",
+        "ref": "nixvm-v1.19",
+        "repo": "libkrun",
+        "type": "github"
+      }
+    },
     "macos-sdk": {
       "flake": false,
       "locked": {
@@ -389,6 +406,7 @@
     },
     "root": {
       "inputs": {
+        "libkrun": "libkrun",
         "nixify": "nixify"
       }
     },
