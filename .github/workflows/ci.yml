@@ -40,4 +40,10 @@ jobs:
           submodules: recursive
       - uses: DeterminateSystems/nix-installer-action@main
       - run: nix develop --command make
+
+  nix-build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
       - run: nix build -L

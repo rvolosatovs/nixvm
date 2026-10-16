@@ -1,9 +1,10 @@
 {
   lib,
-  stdenv,
   rustPlatform,
   pkg-config,
+  makeWrapper,
   darwin,
+  xcbuild,
   nix,
   libkrun,
   src,
@@ -16,11 +17,9 @@ rustPlatform.buildRustPackage {
   inherit (cargoToml.package) version;
   inherit src;
 
-  # `github:` flake refs are tarballs without submodule contents.
   postUnpack = ''
-    rm -rf $sourceRoot/vendor/libkrun
-    mkdir -p $sourceRoot/vendor
-    cp -r ${libkrun.src} $sourceRoot/vendor/libkrun
+    mkdir -p $sourceRoot/vendor/libkrun
+    cp -r ${libkrun.src}/krun-sys $sourceRoot/vendor/libkrun/krun-sys
     chmod -R u+w $sourceRoot/vendor/libkrun
   '';
 
@@ -29,8 +28,10 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     pkg-config
     rustPlatform.bindgenHook
-  ]
-  ++ lib.optional stdenv.hostPlatform.isDarwin darwin.sigtool;
+    makeWrapper
+    darwin.sigtool
+    xcbuild
+  ];
 
   buildInputs = [
     libkrun
@@ -41,8 +42,12 @@ rustPlatform.buildRustPackage {
 
   doCheck = false;
 
-  postFixup = lib.optionalString stdenv.hostPlatform.isDarwin ''
-    codesign --force --sign - --entitlements $src/entitlements.plist $out/bin/nixvm
+  postInstall = ''
+    wrapProgram $out/bin/nixvm --prefix PATH : ${lib.makeBinPath [ nix ]}
+  '';
+
+  postFixup = ''
+    codesign --force --sign - --entitlements $src/entitlements.plist $out/bin/.nixvm-wrapped
   '';
 
   meta = {

@@ -37,7 +37,9 @@
           libkrun = libkrun-efi;
         };
       };
-      overlay = final: _: { inherit (mkPackages final) nixvm; };
+      overlay = final: _: {
+        inherit (self.packages.${final.stdenv.hostPlatform.system}) nixvm;
+      };
     in
     rust.mkFlake {
       src = self;
