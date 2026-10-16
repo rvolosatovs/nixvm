@@ -9,9 +9,10 @@
   src,
 }:
 let
-  version = lib.head (
-    builtins.match ".*\nFULL_VERSION=([^\n]+)\n.*" (builtins.readFile "${src}/Makefile")
-  );
+  makeVar =
+    name: lib.head (builtins.match ".*\n${name}=([^\n]+)\n.*" (builtins.readFile "${src}/Makefile"));
+  version = makeVar "FULL_VERSION";
+  abiVersion = makeVar "ABI_VERSION";
   variant = lib.optionalString stdenv.hostPlatform.isDarwin "-efi";
   features =
     if stdenv.hostPlatform.isDarwin then
@@ -52,7 +53,7 @@ stdenv.mkDerivation {
   + (
     if stdenv.hostPlatform.isDarwin then
       ''
-        install_name_tool -id $out/lib/libkrun${variant}.1.dylib target/release/libkrun.dylib
+        install_name_tool -id $out/lib/libkrun${variant}.${abiVersion}.dylib target/release/libkrun.dylib
         cp target/release/libkrun.dylib target/release/libkrun${variant}.${version}.dylib
       ''
     else
@@ -79,6 +80,6 @@ stdenv.mkDerivation {
     description = "Dynamic library providing Virtualization-based process isolation capabilities";
     homepage = "https://github.com/rvolosatovs/libkrun";
     license = lib.licenses.asl20;
-    platforms = lib.platforms.darwin ++ lib.platforms.linux;
+    platforms = [ "aarch64-darwin" ] ++ lib.platforms.linux;
   };
 }

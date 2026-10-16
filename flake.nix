@@ -19,6 +19,26 @@
       ...
     }:
     with nixify.lib;
+    let
+      mkPackages = pkgs: rec {
+        libkrun-efi = pkgs.callPackage ./nix/libkrun.nix { src = libkrun; };
+        nixvm = pkgs.callPackage ./nix/nixvm.nix {
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./build.rs
+              ./src
+              ./c_src
+              ./entitlements.plist
+            ];
+          };
+          libkrun = libkrun-efi;
+        };
+      };
+      overlay = final: _: { inherit (mkPackages final) nixvm; };
+    in
     rust.mkFlake {
       src = self;
 
@@ -26,13 +46,18 @@
       # libkrun or codesign the binary; nix/*.nix do both.
       withPackages =
         { pkgs, ... }:
-        pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "aarch64-darwin") rec {
-          libkrun-efi = pkgs.callPackage ./nix/libkrun.nix { src = libkrun; };
-          nixvm = pkgs.callPackage ./nix/nixvm.nix {
-            src = self;
-            libkrun = libkrun-efi;
-          };
-          default = nixvm;
+        pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "aarch64-darwin") (
+          let
+            packages = mkPackages pkgs;
+          in
+          packages // { default = packages.nixvm; }
+        );
+      withOverlays =
+        { overlays, ... }:
+        overlays
+        // {
+          default = overlay;
+          nixvm = overlay;
         };
       withChecks = _: { };
 

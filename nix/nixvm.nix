@@ -19,6 +19,7 @@ rustPlatform.buildRustPackage {
   # `github:` flake refs are tarballs without submodule contents.
   postUnpack = ''
     rm -rf $sourceRoot/vendor/libkrun
+    mkdir -p $sourceRoot/vendor
     cp -r ${libkrun.src} $sourceRoot/vendor/libkrun
     chmod -R u+w $sourceRoot/vendor/libkrun
   '';
@@ -47,7 +48,7 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "Launch a NixOS flake output as an ephemeral VM via libkrun";
     homepage = "https://github.com/rvolosatovs/nixvm";
-    platforms = lib.platforms.darwin;
+    platforms = [ "aarch64-darwin" ];
     mainProgram = "nixvm";
   };
 }
